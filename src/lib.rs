@@ -21,12 +21,12 @@ impl Default for Reduction {
 /// CRF
 /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L9
 pub struct CRF {
-    pub num_tags: usize,
-    batch_first: bool,
+    pub(crate) num_tags: usize,
+    pub(crate) batch_first: bool,
 
-    start_transitions: Tensor,
-    end_transitions: Tensor,
-    transitions: Tensor,
+    pub(crate) start_transitions: Tensor,
+    pub(crate) end_transitions: Tensor,
+    pub(crate) transitions: Tensor,
 }
 
 /// CRF
@@ -45,6 +45,9 @@ impl CRF {
     /// Create a new CRF
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L38
     pub fn new(num_tags: usize, batch_first: bool, device: &Device) -> Result<Self> {
+        if num_tags == 0 {
+            return Err(Error::Msg("num_tags must be greater than 0".to_string()));
+        }
         let start_transitions =
             Tensor::zeros(num_tags, DType::F64, &device)?.rand_like(-0.1, 1.0)?;
         let end_transitions = Tensor::zeros(num_tags, DType::F64, &device)?.rand_like(-0.1, 1.0)?;
@@ -60,6 +63,8 @@ impl CRF {
         })
     }
 
+    /// validate
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L142
     fn validate(
         &self,
         emissions: &Tensor,
@@ -114,6 +119,8 @@ impl CRF {
         Ok(())
     }
 
+    /// compute_score
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L172
     fn compute_score(&self, emissions: &Tensor, tags: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (d1, d2, d3) = emissions.dims3()?;
         let (seq_length, batch_size) = tags.dims2()?;
@@ -167,6 +174,8 @@ impl CRF {
         score.broadcast_add(&self.end_transitions.i(&last_tags)?)
     }
 
+    /// compute_normalizer
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L211
     fn compute_normalizer(&self, emissions: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (d1, d2, d3) = emissions.dims3()?;
         let (seq_length, batch_size) = mask.dims2()?;
@@ -196,6 +205,8 @@ impl CRF {
         score.log_sum_exp(1)
     }
 
+    /// viterbi_decode
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L262
     fn viterbi_decode(&self, emissions: &Tensor, mask: &Tensor) -> Result<Vec<Vec<u32>>> {
         let (d1, d2, d3) = emissions.dims3()?;
         let (seq_length, batch_size) = mask.dims2()?;
@@ -210,70 +221,52 @@ impl CRF {
         let mut history = Vec::with_capacity(seq_length);
         for i in 1..seq_length {
             let broadcast_sore = score.unsqueeze(2)?;
-            // println!("broadcast_score: {:?}", broadcast_sore.to_vec3::<f32>()?);
 
             let broadcast_emission = emissions.i(i)?.unsqueeze(1)?;
-            // println!(
-            //     "broadcast_emission: {:?}",
-            //     broadcast_emission.to_vec3::<f32>()?
-            // );
 
             let next_score = broadcast_sore
                 .broadcast_add(&self.transitions)?
                 .broadcast_add(&broadcast_emission)?;
 
-            // println!("next_score: {:?}", next_score.to_vec3::<f32>()?);
-
             let (next_score, indices) = max_indices(&next_score, 1)?;
-            // println!("next_score: {:?}", next_score.to_vec2::<f32>()?);
-            // println!("indices: {:?}", indices.to_vec2::<u32>()?);
 
             let z = mask.i(i)?.unsqueeze(1)?.broadcast_as(next_score.shape())?;
             score = z.where_cond(&next_score, &score)?;
-            // println!("score: {:?}", score.to_vec2::<f32>()?);
             history.push(indices);
         }
 
         score = score.broadcast_add(&self.end_transitions)?;
-        // println!("score: {:?}", score.to_vec2::<f32>()?);
 
         let seq_ends = mask
             .to_dtype(DType::I64)?
             .sum(0)?
             .broadcast_sub(&Tensor::ones(1, DType::I64, mask.device())?)?;
-        // println!("seq_ends: {:?}", seq_ends.to_vec1::<i64>()?);
 
         let mut best_tags_list = vec![];
 
         for idx in 0..batch_size {
             let best_last_tag = score.i(idx)?.argmax(0)?;
-            // println!(
-            //     "{idx}:best_last_tag: {:?}",
-            //     best_last_tag.to_scalar::<u32>()?
-            // );
 
             let mut best_tags = vec![best_last_tag.to_scalar::<u32>()?];
-            // println!("{idx}:best_tags: {:?}", best_tags);
 
             let z = seq_ends.i(idx)?.to_scalar::<i64>()? as usize;
             let mut a = history[..z].to_vec();
             a.reverse();
             for hist in a.iter() {
-                // println!("hist: {:?}", hist.to_vec2::<u32>()?);
                 let last_idx = *best_tags.last().unwrap() as usize;
                 let best_last_tag = hist.i(idx)?.i(last_idx)?;
-                // println!("best_last_tag: {:?}", best_last_tag.to_scalar::<u32>()?);
                 best_tags.push(best_last_tag.to_scalar::<u32>()?);
             }
 
             best_tags.reverse();
-            // println!("best_tags: {:?}", best_tags);
             best_tags_list.push(best_tags);
         }
 
         Ok(best_tags_list)
     }
 
+    /// decode
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L118
     pub fn decode(&self, emissions: &Tensor, mask: Option<&Tensor>) -> Result<Vec<Vec<u32>>> {
         self.validate(emissions, None, mask)?;
         let mask = if let Some(mask) = mask {
@@ -291,6 +284,8 @@ impl CRF {
         self.viterbi_decode(&emissions, &mask)
     }
 
+    /// Forward
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L63
     pub fn forward(
         &self,
         emissions: &Tensor,
@@ -364,4 +359,31 @@ pub(crate) fn max_indices<D: Dim + Copy>(x: &Tensor, dim: D) -> Result<(Tensor, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L60
+    #[test]
+    fn test_minial() {
+        let num_tags = 10;
+        let crf = CRF::new(num_tags, false, &Device::Cpu).unwrap();
+        assert_eq!(crf.num_tags, num_tags);
+        assert!(!crf.batch_first);
+        assert_eq!(crf.start_transitions.dims1().unwrap(), num_tags);
+        assert_eq!(crf.end_transitions.dims1().unwrap(), num_tags);
+        assert_eq!(crf.transitions.dims2().unwrap(), (num_tags, num_tags));
+        println!("crf:{}", crf);
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L74
+    #[test]
+    fn test_full() {
+        let crf = CRF::new(10, true, &Device::Cpu).unwrap();
+        assert!(crf.batch_first);
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L78C9-L78C34
+    #[test]
+    fn test_nonpositive_num_tags() {
+        let crf = CRF::new(0, false, &Device::Cpu);
+        assert!(crf.is_err());
+    }
 }
