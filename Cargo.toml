@@ -1,0 +1,8 @@
+[package]
+name = "candle-crf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = { git = "https://github.com/huggingface/candle" }
+candle-nn = { git = "https://github.com/huggingface/candle" }
