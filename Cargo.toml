@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 candle-core = { git = "https://github.com/huggingface/candle" }
 candle-nn = { git = "https://github.com/huggingface/candle" }
+
+[dev-dependencies]
+itertools = "0.13.0"
+tuple-conv = "1.0.1"
