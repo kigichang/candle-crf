@@ -130,31 +130,16 @@ impl CRF {
         assert_eq!(mask.shape(), tags.shape());
         assert!(all(&mask.i(0)?)?);
 
-        // println!("tags: {:?}", tags.to_vec2::<i64>()?);
-
         let mask = mask.to_dtype(emissions.dtype())?;
 
-        // println!("mask: {:?}", mask.to_vec2::<f32>()?);
-
-        // println!(
-        //     "start_transitions: {:?}",
-        //     self.start_transitions.to_vec1::<f32>()?
-        // );
-
         let mut score = self.start_transitions.i(&tags.i(0)?)?;
-        // println!("score: {:?}", score.to_vec1::<f32>()?);
-
-        // println!("emissions: {:?}", emissions.to_vec3::<f32>()?);
 
         let z = multi_index(&emissions.i((0, 0..batch_size))?, &tags.i(0)?)?;
-        // println!("z: {:?}", z.to_vec1::<f32>()?);
 
         score = score.broadcast_add(&z)?;
-        // println!("score: {:?}", score.to_vec1::<f32>()?);
 
         for i in 1..seq_length {
             let z = multi_index(&self.transitions.i(&tags.i(i - 1)?)?, &tags.i(i)?)?;
-            // println!("{i}, z: {:?}", z.to_vec1::<f32>()?);
             score = score.broadcast_add(&z.broadcast_mul(&mask.i(i)?)?)?;
 
             let z = multi_index(&emissions.i((i, 0..batch_size))?, &tags.i(i)?)?;
@@ -166,24 +151,13 @@ impl CRF {
             .sum(0)?
             .broadcast_sub(&Tensor::ones(1, DType::I64, mask.device())?)?;
 
-        println!("--- 170 start ---");
-        println!("tags: {:?}", tags.to_vec2::<i64>()?);
-        println!("seq_ends: {:?}", seq_ends.to_vec1::<i64>()?);
-        println!(
-            "arrange: {:?}",
-            Tensor::arange(0, batch_size as i64, mask.device())?.to_vec1::<i64>()?
-        );
-        println!("tags.i(&seq_ends):{:?}", tags.i(&seq_ends));
-        let last_tags = if seq_ends.dims1()? == 1 {
-            tags.i(seq_ends.i(0)?.to_scalar::<i64>()? as usize)?
-        } else {
-            multi_index(
-                &tags.i(&seq_ends)?,
+        let last_tags = dim2_i(
+            &tags,
+            (
+                &seq_ends,
                 &Tensor::arange(0, batch_size as i64, mask.device())?,
-            )?
-        };
-        println!("last_tags: {:?}", last_tags.to_vec1::<i64>()?);
-        println!("--- 170 end ---");
+            ),
+        )?;
 
         score.broadcast_add(&self.end_transitions.i(&last_tags)?)
     }
@@ -214,8 +188,6 @@ impl CRF {
         }
 
         score = score.broadcast_add(&self.end_transitions)?;
-        // println!("score: {:?}", score.to_vec2::<f32>()?);
-        // println!("result: {:?}", score.log_sum_exp(1)?.to_vec1::<f32>()?);
         score.log_sum_exp(1)
     }
 
@@ -230,7 +202,6 @@ impl CRF {
         assert!(all(&mask.i(0)?)?);
 
         let mut score = self.start_transitions.broadcast_add(&emissions.i(0)?)?;
-        // println!("score: {:?}", score.to_vec2::<f32>()?);
 
         let mut history = Vec::with_capacity(seq_length);
         for i in 1..seq_length {
@@ -356,12 +327,23 @@ pub(crate) fn all(x: &Tensor) -> Result<bool> {
 // -----------------------------------------------------------------------------
 
 pub(crate) fn multi_index(src: &Tensor, idx: &Tensor) -> Result<Tensor> {
-    println!("src: {:?}", src.shape());
-    println!("idx: {:?}", idx.shape());
     let index = idx.reshape((idx.dim(0)?, 1))?;
     src.gather(&index, D::Minus1)?.squeeze(D::Minus1)
 }
 
+// -----------------------------------------------------------------------------
+
+pub(crate) fn dim2_i(src: &Tensor, idx: (&Tensor, &Tensor)) -> Result<Tensor> {
+    if idx.0.dims1()? == 1 {
+        let (x, y) = (
+            idx.0.i(0)?.to_scalar::<i64>()? as usize,
+            idx.1.i(0)?.to_scalar::<i64>()? as usize,
+        );
+        src.i((x, y))?.unsqueeze(D::Minus1)
+    } else {
+        multi_index(&src.i(idx.0)?, &idx.1)
+    }
+}
 // -----------------------------------------------------------------------------
 
 pub(crate) fn max_indices<D: Dim + Copy>(x: &Tensor, dim: D) -> Result<(Tensor, Tensor)> {
@@ -456,7 +438,7 @@ mod tests {
             let z = emission.i((i, t as usize))?;
             score = score.broadcast_add(&z)?;
         }
-        println!("score: {:?}", score);
+
         Ok(score)
     }
 
@@ -611,7 +593,7 @@ mod tests {
 
             manual_llh += numerator - denominator;
         }
-        //println!("manual_llh: {:?}", manual_llh);
+        println!("manual_llh: {:?}", manual_llh);
         assert_close(llh.to_scalar::<f64>().unwrap(), manual_llh, EPSILON);
         llh.backward().unwrap();
     }
