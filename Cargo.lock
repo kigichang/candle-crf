@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "candle-crf"
-version = "0.1.0"
+version = "0.7.2"
 dependencies = [
  "candle-core",
  "candle-nn",
