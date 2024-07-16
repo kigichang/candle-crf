@@ -7,7 +7,7 @@ readme = "README.md"
 repository = "https://github.com/kigichang/candle-crf"
 license = "MIT"
 license-file = "LICENSE"
-keywords = ["candle", "crf", "conditional random field", "pytorch"]
+keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
 candle-core = { git = "https://github.com/huggingface/candle", version = "0.6.0"}
