@@ -144,15 +144,15 @@ impl CRF {
 
         let mut score = self.start_transitions.i(&tags.i(0)?)?;
 
-        let z = multi_index(&emissions.i((0, 0..batch_size))?, &tags.i(0)?)?;
+        let z = gather(&emissions.i((0, 0..batch_size))?, &tags.i(0)?)?;
 
         score = score.broadcast_add(&z)?;
 
         for i in 1..seq_length {
-            let z = multi_index(&self.transitions.i(&tags.i(i - 1)?)?, &tags.i(i)?)?;
+            let z = gather(&self.transitions.i(&tags.i(i - 1)?)?, &tags.i(i)?)?;
             score = score.broadcast_add(&z.broadcast_mul(&mask.i(i)?)?)?;
 
-            let z = multi_index(&emissions.i((i, 0..batch_size))?, &tags.i(i)?)?;
+            let z = gather(&emissions.i((i, 0..batch_size))?, &tags.i(i)?)?;
             score = score.broadcast_add(&z.broadcast_mul(&mask.i(i)?)?)?;
         }
 
@@ -161,7 +161,7 @@ impl CRF {
             .sum(0)?
             .broadcast_sub(&Tensor::ones(1, DType::I64, mask.device())?)?;
 
-        let last_tags = multi_index(
+        let last_tags = gather(
             &tags.i(&seq_ends)?,
             &Tensor::arange(0, batch_size as i64, mask.device())?,
         )?;
@@ -333,7 +333,7 @@ pub(crate) fn all(x: &Tensor) -> Result<bool> {
 
 // -----------------------------------------------------------------------------
 
-pub(crate) fn multi_index(src: &Tensor, idx: &Tensor) -> Result<Tensor> {
+pub(crate) fn gather(src: &Tensor, idx: &Tensor) -> Result<Tensor> {
     let index = idx.reshape((idx.dim(0)?, 1))?;
     src.gather(&index, D::Minus1)?.squeeze(D::Minus1)
 }
@@ -367,27 +367,6 @@ mod tests {
 
     const EPSILON: f64 = 1e-12;
 
-    #[test]
-    fn test_i() {
-        let src = Tensor::new(
-            &[[[0.0_f64, 1.0], [2.0, 3.0]], [[4.0, 5.0], [6.0, 7.0]]],
-            &Device::Cpu,
-        )
-        .unwrap();
-        println!("{:?}", src.is_contiguous());
-        println!("{:?}", src.i(0).unwrap().shape());
-        println!("{:?}", src.i((0, .., 0)).unwrap().is_contiguous());
-        println!("{:?}", src.i((.., 0, ..)).unwrap().is_contiguous());
-
-        let src = Tensor::new(&[[1_i64], [3], [0]], &Device::Cpu).unwrap();
-        let idx = (
-            Tensor::new(&[2_i64], &Device::Cpu).unwrap(),
-            Tensor::new(&[0_i64], &Device::Cpu).unwrap(),
-        );
-
-        println!("{:?}", src.i((&idx.0, &idx.1)).unwrap().to_vec2::<i64>());
-    }
-
     fn assert_close(a: f64, b: f64, epsilon: f64) {
         assert!((a - b).abs() < epsilon);
     }
@@ -400,71 +379,6 @@ mod tests {
         for (a, b) in a_vec.iter().zip(b_vec.iter()) {
             assert!((a - b).abs() < epsilon);
         }
-    }
-
-    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L37
-    fn make_crf(
-        num_tags: usize,
-        batch_first: bool,
-        start: Option<Tensor>,
-        end: Option<Tensor>,
-        transition: Option<Tensor>,
-    ) -> candle_core::Result<CRF> {
-        let mut crf = CRF::new(num_tags, batch_first, &candle_core::Device::Cpu)?;
-        if let Some(start) = start {
-            crf.start_transitions = start.to_device(&Device::Cpu)?;
-        }
-        if let Some(end) = end {
-            crf.end_transitions = end.to_device(&Device::Cpu)?;
-        }
-        if let Some(transition) = transition {
-            crf.transitions = transition.to_device(&Device::Cpu)?;
-        }
-        Ok(crf)
-    }
-
-    /// assert_all
-    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L23
-    fn assert_all<D: candle_core::WithDType>(x: &Tensor, lo: D, up: D) -> Result<bool> {
-        assert_eq!(x.dims().len(), 1);
-        let dim = x.dims1()?;
-        for i in 0..dim {
-            let a = x.i(i)?.to_scalar::<D>()?;
-            if a < lo || a > up {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// compute_score
-    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L18
-    fn compute_score(crf: &CRF, emission: &Tensor, tag: &Tensor) -> candle_core::Result<Tensor> {
-        assert_eq!(emission.dims().len(), 2);
-        let (emission_dim1, emission_dim2) = emission.dims2()?;
-        let tag_dim1 = tag.dims1()?;
-        assert_eq!(emission_dim1, tag_dim1);
-        assert_eq!(emission_dim2, crf.num_tags);
-        assert_all(tag, 0_i64, crf.num_tags as i64 - 1)?;
-
-        let tag_vec = tag.to_vec1::<i64>()?;
-
-        let mut score = crf
-            .start_transitions
-            .i(tag_vec[0] as usize)?
-            .broadcast_add(&crf.end_transitions.i(tag_vec[tag_vec.len() - 1] as usize)?)?;
-
-        for (cur_tag, next_tag) in tag_vec.iter().zip(tag_vec.iter().skip(1)) {
-            let z = crf.transitions.i((*cur_tag as usize, *next_tag as usize))?;
-            score = score.broadcast_add(&z)?;
-        }
-
-        for (i, &t) in tag_vec.iter().enumerate() {
-            let z = emission.i((i, t as usize))?;
-            score = score.broadcast_add(&z)?;
-        }
-
-        Ok(score)
     }
 
     fn cartestian_product(r: Vec<i64>, repeat: usize, dev: &Device) -> Result<Vec<Tensor>> {
@@ -495,14 +409,69 @@ mod tests {
             .collect())
     }
 
-    #[test]
-    fn test_cartestian_product() {
-        let a = (0..5_i64).collect::<Vec<_>>();
-        let a = cartestian_product(a, 3, &Device::Cpu).unwrap();
-        println!("{:?}", a);
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L37
+    fn make_crf(
+        num_tags: usize,
+        batch_first: bool,
+        start: Option<Tensor>,
+        end: Option<Tensor>,
+        transition: Option<Tensor>,
+    ) -> candle_core::Result<CRF> {
+        let mut crf = CRF::new(num_tags, batch_first, &candle_core::Device::Cpu)?;
+        if let Some(start) = start {
+            crf.start_transitions = start.to_device(&Device::Cpu)?;
+        }
+        if let Some(end) = end {
+            crf.end_transitions = end.to_device(&Device::Cpu)?;
+        }
+        if let Some(transition) = transition {
+            crf.transitions = transition.to_device(&Device::Cpu)?;
+        }
+        Ok(crf)
     }
 
-    /// test_minial
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L23
+    fn assert_all<D: candle_core::WithDType>(x: &Tensor, lo: D, up: D) -> Result<bool> {
+        assert_eq!(x.dims().len(), 1);
+        let dim = x.dims1()?;
+        for i in 0..dim {
+            let a = x.i(i)?.to_scalar::<D>()?;
+            if a < lo || a > up {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L18
+    fn compute_score(crf: &CRF, emission: &Tensor, tag: &Tensor) -> candle_core::Result<Tensor> {
+        assert_eq!(emission.dims().len(), 2);
+        let (emission_dim1, emission_dim2) = emission.dims2()?;
+        let tag_dim1 = tag.dims1()?;
+        assert_eq!(emission_dim1, tag_dim1);
+        assert_eq!(emission_dim2, crf.num_tags);
+        assert_all(tag, 0_i64, crf.num_tags as i64 - 1)?;
+
+        let tag_vec = tag.to_vec1::<i64>()?;
+
+        let mut score = crf
+            .start_transitions
+            .i(tag_vec[0] as usize)?
+            .broadcast_add(&crf.end_transitions.i(tag_vec[tag_vec.len() - 1] as usize)?)?;
+
+        for (cur_tag, next_tag) in tag_vec.iter().zip(tag_vec.iter().skip(1)) {
+            let z = crf.transitions.i((*cur_tag as usize, *next_tag as usize))?;
+            score = score.broadcast_add(&z)?;
+        }
+
+        for (i, &t) in tag_vec.iter().enumerate() {
+            let z = emission.i((i, t as usize))?;
+            score = score.broadcast_add(&z)?;
+        }
+
+        Ok(score)
+    }
+
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L60
     #[test]
     fn test_init_minial() {
@@ -516,7 +485,6 @@ mod tests {
         println!("crf:{}", crf);
     }
 
-    /// test_full
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L74
     #[test]
     fn test_init_full() {
@@ -531,7 +499,6 @@ mod tests {
         assert!(crf.is_err());
     }
 
-    /// test_forward_works_with_mask
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L85
     #[test]
     fn test_forward_works_with_mask() {
@@ -623,7 +590,6 @@ mod tests {
         llh.backward().unwrap();
     }
 
-    /// test_forward_works_without_mask
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L122C9-L122C32
     #[test]
     fn test_forward_works_without_mask() {
@@ -696,7 +662,6 @@ mod tests {
         )
     }
 
-    /// test_forward_batched_loss
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L135
     #[test]
     fn test_forward_batched_loss() {
@@ -896,7 +861,6 @@ mod tests {
         assert_close(llh.to_scalar::<f64>().unwrap(), total_llh, EPSILON);
     }
 
-    /// test_forward_reduction_none
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L159
     #[test]
     fn test_forward_reduction_none() {
@@ -981,7 +945,6 @@ mod tests {
         assert_tensor_close(&llh, &manual_llh, EPSILON);
     }
 
-    /// test_forward_reduction_mean
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
     #[test]
     fn test_forward_reduction_mean() {
@@ -1079,7 +1042,6 @@ mod tests {
         assert_close(llh.to_scalar::<f64>().unwrap(), manual_llh, EPSILON);
     }
 
-    /// test_forward_token_mean
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
     #[test]
     fn test_forward_token_mean() {
@@ -1180,7 +1142,6 @@ mod tests {
         llh.backward().unwrap();
     }
 
-    /// test_forward_batch_first
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L263
     #[test]
     fn test_forward_batch_first() {
@@ -1254,7 +1215,6 @@ mod tests {
         );
     }
 
-    /// test_forward_emissions_has_bad_number_of_dimension
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L286
     #[test]
     fn test_forward_emissions_has_bad_number_of_dimension() {
@@ -1271,7 +1231,6 @@ mod tests {
         );
     }
 
-    /// test_forward_emissions_and_tags_size_mismatch
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L295C9-L295C46
     #[test]
     fn test_forward_emissions_and_tags_size_mismatch() {
@@ -1287,7 +1246,6 @@ mod tests {
         );
     }
 
-    /// test_forward_emissions_last_dimension_not_equal_to_number_of_tags
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L306C9-L306C66
     #[test]
     fn test_forward_emissions_last_dimension_not_equal_to_number_of_tags() {
@@ -1303,7 +1261,6 @@ mod tests {
         )
     }
 
-    /// test_first_timestep_mask_is_not_all_on
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L315C9-L315C47
     #[test]
     fn test_forward_first_timestep_mask_is_not_all_on() {
@@ -1337,6 +1294,7 @@ mod tests {
         );
     }
 
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L345
     #[test]
     fn test_decode_works_with_mask() {
         let crf = make_crf(
@@ -1384,8 +1342,10 @@ mod tests {
             .unwrap();
         let best_tags = crf.decode(&emissions, Some(&mask));
         println!("best_tags: {:?}", best_tags);
+        assert_eq!(best_tags.unwrap(), vec![vec![0, 3, 0], vec![2, 2]]);
     }
 
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L372
     #[test]
     fn test_decode_works_without_mask() {
         let crf = make_crf(
@@ -1430,8 +1390,13 @@ mod tests {
 
         let best_tags_no_mask = crf.decode(&emissions, None);
         println!("best_tags: {:?}", best_tags_no_mask);
+        assert_eq!(
+            best_tags_no_mask.unwrap(),
+            vec![vec![0, 4, 2], vec![0, 2, 1]]
+        )
     }
 
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L384C9-L384C28
     #[test]
     fn test_decode_batched_decode() {
         let crf = make_crf(
@@ -1504,9 +1469,12 @@ mod tests {
         }
         println!("non_batched: {:?}", non_batched);
 
-        assert_eq!(batched.unwrap(), non_batched);
+        let batched = batched.unwrap();
+        assert_eq!(batched, non_batched);
+        assert_eq!(batched, vec![vec![3, 4, 1], vec![0, 4]])
     }
 
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L408
     #[test]
     fn test_decode_batch_first() {
         let crf = make_crf(
@@ -1565,12 +1533,81 @@ mod tests {
         let best_tags_bf = crf_bf.decode(&emissions, None);
         println!("best_tags_bf: {:?}", best_tags_bf);
 
-        assert_eq!(best_tags.unwrap(), best_tags_bf.unwrap());
+        let best_tags = best_tags.unwrap();
+        let best_tags_bf = best_tags_bf.unwrap();
+        assert_eq!(best_tags, best_tags_bf);
+        assert_eq!(best_tags, vec![vec![1, 3, 0], vec![1, 2, 4]]);
     }
 
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L427
     #[test]
-    fn test_arrage() {
-        let a = Tensor::arange(0_i64, 1, &Device::Cpu).unwrap();
-        println!("{:?}", a.to_vec1::<i64>().unwrap());
+    fn test_decode_emissions_has_bad_number_of_dimension() {
+        let emissions = Tensor::randn(0.0_f64, 1., (1, 2), &Device::Cpu).unwrap();
+        let crf = make_crf(5, false, None, None, None).unwrap();
+        let result = crf.decode(&emissions, None);
+        println!("{:?}", result);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "emissions must have 3 dimensions, got 2"
+        );
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L435
+    #[test]
+    fn test_decode_emissions_last_dimension_not_equal_to_number_of_tags() {
+        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
+        let crf = make_crf(10, false, None, None, None).unwrap();
+        let result = crf.decode(&emissions, None);
+        println!("{:?}", result);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "expected last dimension of emissions is 10, got 3"
+        )
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L443
+    #[test]
+    fn test_decode_emissions_and_mask_size_mismatch() {
+        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
+        let mask = Tensor::new(&[[1_u8, 1], [1, 0]], &Device::Cpu).unwrap();
+        let crf = make_crf(3, false, None, None, None).unwrap();
+        let result = crf.decode(&emissions, Some(&mask));
+        println!("{:?}", result);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "the first two dimensions of emissions and mask must match, got (1, 2) and (2, 2)"
+        );
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L454
+    #[test]
+    fn test_decode_first_timestep_mask_is_not_all_on() {
+        let emissions = Tensor::randn(0.0_f64, 1., (3, 2, 4), &Device::Cpu).unwrap();
+        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)
+            .unwrap()
+            .transpose(0, 1)
+            .unwrap();
+        let crf = make_crf(4, false, None, None, None).unwrap();
+        let result = crf.decode(&emissions, Some(&mask));
+        println!("{:?}", result);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "mask of the first timestep must all be on"
+        );
+
+        let emissions = emissions.transpose(0, 1).unwrap();
+        let mask = mask.transpose(0, 1).unwrap();
+        let crf = make_crf(4, true, None, None, None).unwrap();
+        let result = crf.decode(&emissions, Some(&mask));
+        println!("{:?}", result);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "mask of the first timestep must all be on"
+        );
     }
 }
