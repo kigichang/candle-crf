@@ -45,14 +45,30 @@ impl CRF {
     /// Create a new CRF
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L38
     pub fn new(num_tags: usize, batch_first: bool, device: &Device) -> Result<Self> {
+        Self::new_with_dtype(num_tags, batch_first, DType::F32, device)
+    }
+
+    pub fn new_with_dtype(
+        num_tags: usize,
+        batch_first: bool,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        {
+            use DType::*;
+            match dtype {
+                BF16 | F16 | F32 | F64 => {}
+                _ => return Err(Error::Msg("dtype must be float".to_string())),
+            }
+        }
+
         if num_tags == 0 {
             return Err(Error::Msg("num_tags must be greater than 0".to_string()));
         }
-        let start_transitions =
-            Tensor::zeros(num_tags, DType::F64, &device)?.rand_like(-0.1, 1.0)?;
-        let end_transitions = Tensor::zeros(num_tags, DType::F64, &device)?.rand_like(-0.1, 1.0)?;
+        let start_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
+        let end_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
         let transitions =
-            Tensor::zeros((num_tags, num_tags), DType::F64, &device)?.rand_like(-0.1, 1.0)?;
+            Tensor::zeros((num_tags, num_tags), dtype, &device)?.rand_like(-0.1, 1.0)?;
 
         Ok(Self {
             num_tags,
@@ -72,6 +88,18 @@ impl CRF {
         mask: Option<&Tensor>,
     ) -> Result<()> {
         {
+            let dtype_transitions = self.transitions.dtype();
+            let dtype_emissions = emissions.dtype();
+            if dtype_transitions != dtype_emissions {
+                return Err(Error::Msg(format!(
+                    "emissions and CRF must have the same dtype, expected {:?}, got {:?}",
+                    dtype_transitions, dtype_emissions
+                )));
+            }
+        }
+
+        {
+            // check if the tensor has 3 dimensions
             let dims = emissions.dims().len();
             if dims != 3 {
                 return Err(Error::Msg(format!(
@@ -81,13 +109,14 @@ impl CRF {
             }
         }
 
-        let (d1, d2, d3) = emissions.dims3()?; // check if the tensor has 3 dimensions
+        let (d1, d2, d3) = emissions.dims3()?;
 
         if d3 != self.num_tags {
+            // check if the last dimension of the tensor is equal to the number of tags
             return Err(Error::Msg(format!(
                 "expected last dimension of emissions is {}, got {}",
                 self.num_tags, d3
-            ))); // check if the last dimension of the tensor is equal to the number of tags
+            )));
         }
 
         if let Some(tags) = tags {
@@ -95,7 +124,15 @@ impl CRF {
                 return Err(Error::Msg("tags must be of type i64".to_string()));
             }
 
-            let (tag_d1, tag_d2) = tags.dims2()?; // check if the tensor has 2 dimensions
+            if tags.dims().len() != 2 {
+                // check if the tensor has 2 dimensions
+                return Err(Error::Msg(format!(
+                    "tags must have 2 dimensions, got {}",
+                    tags.dims().len()
+                )));
+            }
+
+            let (tag_d1, tag_d2) = tags.dims2()?;
             if (d1, d2) != (tag_d1, tag_d2) {
                 return Err(Error::Msg(format!(
                     "the first two dimensions of emissions and tags must match, got ({}, {}) and ({}, {})",
@@ -108,7 +145,16 @@ impl CRF {
             if mask.dtype() != DType::U8 {
                 return Err(Error::Msg("mask must be of type u8".to_string()));
             }
-            let (mask_d1, mask_d2) = mask.dims2()?; // check if the tensor has 2 dimensions
+
+            if mask.dims().len() != 2 {
+                // check if the tensor has 2 dimensions
+                return Err(Error::Msg(format!(
+                    "mask must have 2 dimensions, got {}",
+                    mask.dims().len()
+                )));
+            }
+
+            let (mask_d1, mask_d2) = mask.dims2()?;
             if (d1, d2) != (mask_d1, mask_d2) {
                 return Err(Error::Msg(format!(
                     "the first two dimensions of emissions and mask must match, got ({}, {}) and ({}, {})",
@@ -323,7 +369,7 @@ impl CRF {
 // -----------------------------------------------------------------------------
 
 pub(crate) fn all(x: &Tensor) -> Result<bool> {
-    let zero = Tensor::zeros(1, x.dtype(), x.device())?;
+    let zero = x.zeros_like()?;
     Ok(x.broadcast_ne(&zero)?
         .flatten_all()?
         .min(0)?
@@ -365,20 +411,32 @@ mod tests {
     use candle_core::{DType, Device, IndexOp, Result, Tensor};
     use itertools::Itertools;
 
-    const EPSILON: f64 = 1e-12;
-
-    fn assert_close(a: f64, b: f64, epsilon: f64) {
-        assert!((a - b).abs() < epsilon);
+    enum DTypeCase {
+        DType(DType),
+        PyTorchCRF,
     }
 
-    fn assert_tensor_close(a: &Tensor, b: &Tensor, epsilon: f64) {
-        let a_vec: Vec<f64> = a.to_vec1().unwrap();
-        let b_vec: Vec<f64> = b.to_vec1().unwrap();
-
-        assert_eq!(a_vec.len(), b_vec.len());
-        for (a, b) in a_vec.iter().zip(b_vec.iter()) {
-            assert!((a - b).abs() < epsilon);
+    fn epsilon(type_case: DTypeCase) -> f64 {
+        match type_case {
+            DTypeCase::DType(dtype) => match dtype {
+                DType::F64 => 1e-12,
+                DType::F32 => 1e-6,
+                DType::F16 => 1e-2,
+                DType::BF16 => 1e-1,
+                _ => panic!("dtype not supported"),
+            },
+            DTypeCase::PyTorchCRF => 1e-3,
         }
+    }
+
+    fn assert_tensor_close(a: &Tensor, b: &Tensor, epsilon: f64) -> Result<()> {
+        assert!(a.dtype() == b.dtype());
+        assert_eq!(a.shape(), b.shape());
+        let epsilon = Tensor::full(epsilon, a.shape(), a.device())?.to_dtype(a.dtype())?;
+        let diff = a.broadcast_sub(b)?.abs()?;
+        let result = all(&diff.broadcast_le(&epsilon)?)?;
+        assert!(result);
+        Ok(())
     }
 
     fn cartestian_product(r: Vec<i64>, repeat: usize, dev: &Device) -> Result<Vec<Tensor>> {
@@ -407,6 +465,29 @@ mod tests {
         Ok(a.iter()
             .map(|x| Tensor::new(x.as_slice(), dev).unwrap())
             .collect())
+    }
+
+    fn cat_scalar_tensor(tensors: Vec<Tensor>) -> Result<Tensor> {
+        let tensors: Vec<Tensor> = tensors
+            .into_iter()
+            .map(|t| t.unsqueeze(0).unwrap())
+            .collect();
+        Tensor::cat(&tensors, 0)
+    }
+
+    #[test]
+    fn test_cat_scalar_tensor() {
+        let mut lst = vec![];
+        for i in 0..10 {
+            let x = Tensor::full(i as f32, (), &Device::Cpu).unwrap();
+            lst.push(x);
+        }
+
+        let result = cat_scalar_tensor(lst).unwrap();
+        assert_eq!(
+            result.to_vec1::<f32>().unwrap(),
+            vec![0., 1., 2., 3., 4., 5., 6., 7., 8., 9.]
+        );
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L37
@@ -472,6 +553,17 @@ mod tests {
         Ok(score)
     }
 
+    #[test]
+    fn test_init_with_dtype() {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            CRF::new_with_dtype(10, false, dtype, &Device::Cpu).unwrap();
+        }
+
+        for dtype in [DType::U8, DType::U32, DType::I64] {
+            assert!(CRF::new_with_dtype(10, false, dtype, &Device::Cpu).is_err());
+        }
+    }
+
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L60
     #[test]
     fn test_init_minial() {
@@ -500,13 +592,18 @@ mod tests {
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L85
-    #[test]
-    fn test_forward_works_with_mask() {
+    fn forward_works_with_mask(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[-0.0687, 0.0698, -0.0447, 0.0421, 0.0782], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0061, -0.0671, -0.0797, 0.0629, -0.0136], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[-0.0687, 0.0698, -0.0447, 0.0421, 0.0782], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0061, -0.0671, -0.0797, 0.0629, -0.0136], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -517,11 +614,10 @@ mod tests {
                         [0.0303, 0.0592, -0.0297, 0.0681, 0.0801],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -539,65 +635,80 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[2_i64, 4], [3, 3], [4, 2]], &Device::Cpu).unwrap();
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)
-            .unwrap()
-            .transpose(0, 1)
-            .unwrap();
-        let llh = crf
-            .forward(&emissions, &tags, Some(&mask), Reduction::default())
-            .unwrap();
+        let tags = Tensor::new(&[[2_i64, 4], [3, 3], [4, 2]], &Device::Cpu)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::default())?;
         println!("llh: {:?}", llh);
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let tags = tags.transpose(0, 1).unwrap();
-        let mask = mask.transpose(0, 1).unwrap();
+        let emissions = emissions.transpose(0, 1)?;
+        let tags = tags.transpose(0, 1)?;
+        let mask = mask.transpose(0, 1)?;
 
-        let (a, _, _) = emissions.dims3().unwrap();
-        let mut manual_llh = 0.0_f64;
+        let (a, _, _) = emissions.dims3()?;
+        let mut manual_llh = Tensor::zeros(llh.shape(), llh.dtype(), llh.device())?;
+
         for i in 0..a {
-            let emission = emissions.i(i).unwrap();
-            let tag = tags.i(i).unwrap();
-            let mask = mask.i(i).unwrap();
+            let emission = emissions.i(i)?;
+            let tag = tags.i(i)?;
+            let mask = mask.i(i)?;
 
-            let seq_len = mask.sum_all().unwrap().to_scalar::<u8>().unwrap() as usize;
-            let emission = emission.i(..seq_len).unwrap();
-            let tag = tag.i(..seq_len).unwrap();
-            let numerator = compute_score(&crf, &emission, &tag)
-                .unwrap()
-                .to_scalar::<f64>()
-                .unwrap();
+            let seq_len = mask.sum_all().unwrap().to_scalar::<u8>()? as usize;
+            let emission = emission.i(..seq_len)?;
+            let tag = tag.i(..seq_len)?;
+            let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
-            let product =
-                cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu).unwrap();
+            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu)?;
             let all_scores = product
                 .iter()
                 .map(|t| compute_score(&crf, &emission, &t).unwrap());
 
-            let denominator = all_scores
-                .map(|x| x.to_scalar::<f64>().unwrap().exp())
-                .sum::<f64>()
-                .ln();
+            let mut denominator =
+                Tensor::zeros(numerator.shape(), numerator.dtype(), numerator.device())?;
 
-            manual_llh += numerator - denominator;
+            for s in all_scores.into_iter() {
+                denominator = denominator.broadcast_add(&s.exp()?)?;
+            }
+            let denominator = denominator.log()?;
+
+            manual_llh = manual_llh.broadcast_add(&numerator.broadcast_sub(&denominator)?)?;
         }
         println!("manual_llh: {:?}", manual_llh);
-        assert_close(llh.to_scalar::<f64>().unwrap(), manual_llh, EPSILON);
-        llh.backward().unwrap();
+        assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::DType(llh.dtype())))?;
+
+        if llh.dtype() == DType::F32 {
+            let manual_llh = Tensor::full(-11.0540_f32, llh.shape(), llh.device())?;
+            println!("Compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
+            assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+        llh.backward()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_works_with_mask() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_works_with_mask(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L122C9-L122C32
-    #[test]
-    fn test_forward_works_without_mask() {
+    fn forward_works_without_mask(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0266, -0.0539, 0.0572, -0.0199, -0.0167], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0084, 0.0892, 0.0942, -0.0179, 0.0112], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0266, -0.0539, 0.0572, -0.0199, -0.0167], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0084, 0.0892, 0.0942, -0.0179, 0.0112], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -608,11 +719,10 @@ mod tests {
                         [0.0925, -0.0708, 0.0765, 0.0671, -0.0344],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -630,49 +740,61 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[3_i64, 2], [3, 1], [4, 3]], &Device::Cpu).unwrap();
+        let tags = Tensor::new(&[[3_i64, 2], [3, 1], [4, 3]], &Device::Cpu)?;
 
-        let llh_no_mask = crf
-            .forward(&emissions, &tags, None, Reduction::default())
-            .unwrap();
+        let llh_no_mask = crf.forward(&emissions, &tags, None, Reduction::default())?;
 
-        let llh_mask = crf
-            .forward(
-                &emissions,
-                &tags,
-                Some(
-                    &Tensor::ones_like(&tags)
-                        .unwrap()
-                        .to_dtype(DType::U8)
-                        .unwrap(),
-                ),
-                Reduction::default(),
-            )
-            .unwrap();
+        let llh_mask = crf.forward(
+            &emissions,
+            &tags,
+            Some(&Tensor::ones_like(&tags)?.to_dtype(DType::U8)?),
+            Reduction::default(),
+        )?;
 
         println!("llh_no_mask: {:?}", llh_no_mask);
         println!("llh_mask: {:?}", llh_mask);
-        assert_close(
-            llh_no_mask.to_scalar::<f64>().unwrap(),
-            llh_mask.to_scalar::<f64>().unwrap(),
-            EPSILON,
+
+        if llh_no_mask.dtype() == DType::F32 {
+            let manual_llh = Tensor::full(-11.0571_f32, llh_no_mask.shape(), llh_no_mask.device())?;
+            println!(
+                "compare with pytorch-crf: {:?}, {:?}",
+                llh_no_mask, manual_llh
+            );
+            assert_tensor_close(&llh_no_mask, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+
+        assert_tensor_close(
+            &llh_no_mask,
+            &llh_mask,
+            epsilon(DTypeCase::DType(llh_no_mask.dtype())),
         )
     }
 
-    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L135
     #[test]
-    fn test_forward_batched_loss() {
+    fn test_forward_works_without_mask() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_works_without_mask(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L135
+    fn forward_batched_loss(dtype: DType) -> Result<()> {
         let batch_size = 10;
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[-0.0695, -0.0117, -0.0021, -0.0635, -0.0328], &Device::Cpu).unwrap(),
+                Tensor::new(&[-0.0695, -0.0117, -0.0021, -0.0635, -0.0328], &Device::Cpu)?
+                    .to_dtype(dtype)?,
             ),
-            Some(Tensor::new(&[-0.0524, -0.0827, 0.0868, -0.0140, 0.0131], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[-0.0524, -0.0827, 0.0868, -0.0140, 0.0131], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -683,11 +805,10 @@ mod tests {
                         [-0.0037, 0.0763, -0.0867, 0.0410, 0.0368],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -813,8 +934,8 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
         let tags = Tensor::new(
             &[
@@ -823,52 +944,64 @@ mod tests {
                 [0, 1, 4, 4, 0, 4, 0, 1, 4, 1],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?;
 
-        let llh = crf
-            .forward(&emissions, &tags, None, Reduction::default())
-            .unwrap();
+        let llh = crf.forward(&emissions, &tags, None, Reduction::default())?;
 
-        llh.dims0().unwrap();
-        println!("{:?}", llh.to_scalar::<f64>().unwrap());
-        let mut total_llh = 0.0_f64;
+        llh.dims0()?;
+        let mut total_llh = Tensor::zeros(llh.shape(), llh.dtype(), llh.device())?;
         for i in 0..batch_size {
             let emissions = emissions
-                .i((.., i, ..))
-                .unwrap()
-                .force_contiguous() // force contiguous to fix tensor indexer.
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap();
+                .i((.., i, ..))?
+                .force_contiguous()? // force contiguous to fix tensor indexer.
+                .unsqueeze(1)?;
 
             let tags = tags
-                .i((.., i))
-                .unwrap()
-                .force_contiguous() // force contiguous to fix tensor indexer.
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap();
-            total_llh += crf
-                .forward(&emissions, &tags, None, Reduction::default())
-                .unwrap()
-                .to_scalar::<f64>()
-                .unwrap();
+                .i((.., i))?
+                .force_contiguous()? // force contiguous to fix tensor indexer.
+                .unsqueeze(1)?;
+
+            total_llh = total_llh.broadcast_add(&crf.forward(
+                &emissions,
+                &tags,
+                None,
+                Reduction::default(),
+            )?)?;
         }
 
         println!("llh: {:?}", llh);
         println!("total_llh: {:?}", total_llh);
-        assert_close(llh.to_scalar::<f64>().unwrap(), total_llh, EPSILON);
+
+        if llh.dtype() == DType::F32 {
+            let manual_llh = Tensor::full(-49.2024_f32, llh.shape(), llh.device())?;
+            println!("compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
+            assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+
+        assert_tensor_close(&llh, &total_llh, epsilon(DTypeCase::DType(llh.dtype())))
+    }
+
+    #[test]
+    fn test_forward_batched_loss() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_batched_loss(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L159
-    #[test]
-    fn test_forward_reduction_none() {
+    fn forward_reduction_none(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0432, 0.0507, -0.0286, 0.0476, -0.0603], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0824, 0.0845, -0.0180, -0.0773, 0.0414], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0432, 0.0507, -0.0286, 0.0476, -0.0603], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0824, 0.0845, -0.0180, -0.0773, 0.0414], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -879,11 +1012,10 @@ mod tests {
                         [0.0104, 0.0299, -0.0182, -0.0515, 0.0424],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -901,58 +1033,75 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[1_i64, 3], [1, 3], [1, 2]], &Device::Cpu).unwrap();
-        let llh = crf
-            .forward(&emissions, &tags, None, Reduction::None)
-            .unwrap();
+        let tags = Tensor::new(&[[1_i64, 3], [1, 3], [1, 2]], &Device::Cpu)?;
+        let llh = crf.forward(&emissions, &tags, None, Reduction::None)?;
         println!("llh: {:?}", llh);
-        let (seq_length, batch_size) = tags.dims2().unwrap();
-        assert_eq!(llh.dims1().unwrap(), batch_size);
+        let (seq_length, batch_size) = tags.dims2()?;
+        assert_eq!(llh.dims1()?, batch_size);
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let tags = tags.transpose(0, 1).unwrap();
+        let emissions = emissions.transpose(0, 1)?;
+        let tags = tags.transpose(0, 1)?;
 
-        let (a, _, _) = emissions.dims3().unwrap();
+        let (a, _, _) = emissions.dims3()?;
         let mut manual_llh = vec![];
         for i in 0..a {
-            let emission = emissions.i(i).unwrap();
-            let tag = tags.i(i).unwrap();
+            let emission = emissions.i(i)?;
+            let tag = tags.i(i)?;
 
-            let numerator = compute_score(&crf, &emission, &tag)
-                .unwrap()
-                .to_scalar::<f64>()
-                .unwrap();
+            let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
             let product =
-                cartestian_product((0..num_tags).collect_vec(), seq_length, &Device::Cpu).unwrap();
+                cartestian_product((0..num_tags).collect_vec(), seq_length, &Device::Cpu)?;
+
             let all_scores = product
                 .iter()
                 .map(|t| compute_score(&crf, &emission, &t).unwrap());
 
-            let denominator = all_scores
-                .map(|x| x.to_scalar::<f64>().unwrap().exp())
-                .sum::<f64>()
-                .ln();
+            let mut denominator = numerator.zeros_like()?;
 
-            manual_llh.push(numerator - denominator);
+            for s in all_scores.into_iter() {
+                denominator = denominator.broadcast_add(&s.exp()?)?;
+            }
+
+            let denominator = denominator.log()?;
+            manual_llh.push((numerator - denominator)?);
         }
-        let manual_llh = Tensor::new(manual_llh.as_slice(), &Device::Cpu).unwrap();
+
+        let manual_llh = cat_scalar_tensor(manual_llh)?;
         println!("manual_llh: {:?}", manual_llh);
-        assert_tensor_close(&llh, &manual_llh, EPSILON);
+        if dtype == DType::F32 {
+            let manual_llh = Tensor::new(&[-6.3064_f32, -7.0368], &Device::Cpu)?;
+            println!("compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
+            assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+        assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::DType(llh.dtype())))
+    }
+
+    #[test]
+    fn test_forward_reduction_none() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_reduction_none(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
-    #[test]
-    fn test_forward_reduction_mean() {
+    fn forward_reduction_mean(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0606, -0.0597, 0.0217, -0.0760, 0.0096], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[-0.0791, -0.0159, 0.0525, 0.0451, -0.0373], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0606, -0.0597, 0.0217, -0.0760, 0.0096], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[-0.0791, -0.0159, 0.0525, 0.0451, -0.0373], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -975,11 +1124,10 @@ mod tests {
                         [-5.0593e-02, 4.5717e-03, 6.8714e-03, 8.9858e-02, -8.2813e-02],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -997,13 +1145,11 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[3_i64, 0], [0, 3], [2, 4]], &Device::Cpu).unwrap();
-        let llh = crf
-            .forward(&emissions, &tags, None, Reduction::Mean)
-            .unwrap();
+        let tags = Tensor::new(&[[3_i64, 0], [0, 3], [2, 4]], &Device::Cpu)?;
+        let llh = crf.forward(&emissions, &tags, None, Reduction::Mean)?;
         println!("llh: {:?}", llh);
 
         let (seq_length, batch_size) = tags.dims2().unwrap();
@@ -1012,49 +1158,70 @@ mod tests {
         let tags = tags.transpose(0, 1).unwrap();
 
         let (a, _, _) = emissions.dims3().unwrap();
-        let mut manual_llh = 0.0_f64;
+        let mut manual_llh = llh.zeros_like()?;
         for i in 0..a {
             let emission = emissions.i(i).unwrap();
             let tag = tags.i(i).unwrap();
 
-            let numerator = compute_score(&crf, &emission, &tag)
-                .unwrap()
-                .to_scalar::<f64>()
-                .unwrap();
+            let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
+
             let product =
-                cartestian_product((0..num_tags).collect_vec(), seq_length, &Device::Cpu).unwrap();
+                cartestian_product((0..num_tags).collect_vec(), seq_length, &Device::Cpu)?;
+
             let all_scores = product
                 .iter()
                 .map(|t| compute_score(&crf, &emission, &t).unwrap());
 
-            let denominator = all_scores
-                .map(|x| x.to_scalar::<f64>().unwrap().exp())
-                .sum::<f64>()
-                .ln();
+            let mut denominator = numerator.zeros_like()?;
 
-            manual_llh += numerator - denominator;
+            for s in all_scores.into_iter() {
+                denominator = denominator.broadcast_add(&s.exp()?)?;
+            }
+
+            let denominator = denominator.log()?;
+
+            manual_llh = (manual_llh + (numerator - denominator)?)?;
         }
-        manual_llh /= batch_size as f64;
+
+        manual_llh = (&manual_llh
+            / Tensor::full(batch_size as f64, manual_llh.shape(), manual_llh.device())?
+                .to_dtype(manual_llh.dtype())?)?;
 
         println!("manual_llh: {:?}", manual_llh);
-        assert_close(llh.to_scalar::<f64>().unwrap(), manual_llh, EPSILON);
+
+        if dtype == DType::F32 {
+            let manual_llh = Tensor::new(-5.7756_f32, &llh.device())?;
+            println!("compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
+            assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+        assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::DType(dtype)))
+    }
+
+    #[test]
+    fn test_forward_reduction_mean() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_reduction_mean(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
-    #[test]
-    fn test_forward_token_mean() {
+    fn forward_token_mean(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0687, 0.0533, 0.0204, 0.0250, -0.0785], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0687, 0.0533, 0.0204, 0.0250, -0.0785], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[4.8827e-02, -9.9134e-05, 9.3184e-02, -7.6271e-02, 3.6482e-02],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
@@ -1066,11 +1233,10 @@ mod tests {
                         [0.0613, 0.0871, -0.0343, 0.0384, 0.0485],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1088,68 +1254,87 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[2_i64, 2], [0, 4], [3, 3]], &Device::Cpu).unwrap();
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)
-            .unwrap()
-            .transpose(0, 1)
-            .unwrap();
-        let llh = crf
-            .forward(&emissions, &tags, Some(&mask), Reduction::TokenMean)
-            .unwrap();
+        let tags = Tensor::new(&[[2_i64, 2], [0, 4], [3, 3]], &Device::Cpu)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::TokenMean)?;
         println!("llh: {:?}", llh);
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let tags = tags.transpose(0, 1).unwrap();
-        let mask = mask.transpose(0, 1).unwrap();
+        let emissions = emissions.transpose(0, 1)?;
+        let tags = tags.transpose(0, 1)?;
+        let mask = mask.transpose(0, 1)?;
 
-        let (a, _, _) = emissions.dims3().unwrap();
-        let mut manual_llh = 0.0_f64;
+        let (a, _, _) = emissions.dims3()?;
+        let mut manual_llh = llh.zeros_like()?;
         let mut total_tokens = 0;
         for i in 0..a {
-            let emission = emissions.i(i).unwrap();
-            let tag = tags.i(i).unwrap();
-            let mask = mask.i(i).unwrap();
+            let emission = emissions.i(i)?;
+            let tag = tags.i(i)?;
+            let mask = mask.i(i)?;
 
-            let seq_len = mask.sum_all().unwrap().to_scalar::<u8>().unwrap() as usize;
-            let emission = emission.i(..seq_len).unwrap();
-            let tag = tag.i(..seq_len).unwrap();
-            let numerator = compute_score(&crf, &emission, &tag)
-                .unwrap()
-                .to_scalar::<f64>()
-                .unwrap();
+            let seq_len = mask.sum_all()?.to_scalar::<u8>()? as usize;
+            let emission = emission.i(..seq_len)?;
+            let tag = tag.i(..seq_len)?;
+            let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
-            let product =
-                cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu).unwrap();
+            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu)?;
+
             let all_scores = product
                 .iter()
                 .map(|t| compute_score(&crf, &emission, &t).unwrap());
 
-            let denominator = all_scores
-                .map(|x| x.to_scalar::<f64>().unwrap().exp())
-                .sum::<f64>()
-                .ln();
+            let mut denominator = numerator.zeros_like()?;
+            for t in all_scores.into_iter() {
+                denominator = denominator.broadcast_add(&t.exp()?)?;
+            }
 
-            manual_llh += numerator - denominator;
+            let denominator = denominator.log()?;
+
+            manual_llh = (manual_llh + (numerator - denominator)?)?;
             total_tokens += seq_len;
         }
-        manual_llh /= total_tokens as f64;
+
+        let total_tokens =
+            Tensor::full(total_tokens as f64, manual_llh.shape(), manual_llh.device())?
+                .to_dtype(manual_llh.dtype())?;
+
+        let manual_llh = (manual_llh / total_tokens)?;
         println!("manual_llh: {:?}", manual_llh);
-        assert_close(llh.to_scalar::<f64>().unwrap(), manual_llh, EPSILON);
-        llh.backward().unwrap();
+
+        if dtype == DType::F32 {
+            let manual_llh = Tensor::new(-1.4603_f32, &llh.device())?;
+            println!("compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
+            assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+        assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::DType(dtype)))?;
+        llh.backward()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_token_mean() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_token_mean(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L263
-    #[test]
-    fn test_forward_batch_first() {
+    fn forward_batch_first(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0384, -0.0811, -0.0291, 0.0444, 0.0943], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0146, 0.0455, 0.0991, 0.0640, -0.0298], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0384, -0.0811, -0.0291, 0.0444, 0.0943], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0146, 0.0455, 0.0991, 0.0640, -0.0298], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -1160,11 +1345,10 @@ mod tests {
                         [-0.0990, -0.0971, 0.0635, 0.0166, 0.0292],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1182,13 +1366,11 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
         let tags = Tensor::new(&[[1_i64, 4], [1, 4], [1, 4]], &Device::Cpu).unwrap();
-        let llh = crf
-            .forward(&emissions, &tags, None, Reduction::default())
-            .unwrap();
+        let llh = crf.forward(&emissions, &tags, None, Reduction::default())?;
         println!("llh: {:?}", llh);
 
         let crf_bf = make_crf(
@@ -1197,31 +1379,37 @@ mod tests {
             Some(crf.start_transitions),
             Some(crf.end_transitions),
             Some(crf.transitions),
-        )
-        .unwrap();
+        )?;
 
         let emissions = emissions.transpose(0, 1).unwrap();
         let tags = tags.transpose(0, 1).unwrap();
 
-        let llh_bf = crf_bf
-            .forward(&emissions, &tags, None, Reduction::default())
-            .unwrap();
+        let llh_bf = crf_bf.forward(&emissions, &tags, None, Reduction::default())?;
         println!("llh_bf: {:?}", llh_bf);
 
-        assert_close(
-            llh.to_scalar::<f64>().unwrap(),
-            llh_bf.to_scalar::<f64>().unwrap(),
-            EPSILON,
-        );
+        if dtype == DType::F32 {
+            let llh_bf = Tensor::new(-14.8640_f32, &llh.device())?;
+            println!("compare with pytorch-crf: {:?}, {:?}", llh, llh_bf);
+            assert_tensor_close(&llh, &llh_bf, epsilon(DTypeCase::PyTorchCRF))?;
+        }
+        assert_tensor_close(&llh, &llh_bf, epsilon(DTypeCase::DType(dtype)))
+    }
+
+    #[test]
+    fn test_forward_batch_first() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            forward_batch_first(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L286
     #[test]
-    fn test_forward_emissions_has_bad_number_of_dimension() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2), &Device::Cpu).unwrap();
-        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu).unwrap();
+    fn test_forward_emissions_has_bad_number_of_dimension() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &Device::Cpu)?;
+        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu)?;
 
-        let crf = make_crf(5, false, None, None, None).unwrap();
+        let crf = make_crf(5, false, None, None, None)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1229,14 +1417,15 @@ mod tests {
             result.err().unwrap().to_string(),
             "emissions must have 3 dimensions, got 2"
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L295C9-L295C46
     #[test]
-    fn test_forward_emissions_and_tags_size_mismatch() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
-        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu).unwrap();
-        let crf = make_crf(3, false, None, None, None).unwrap();
+    fn test_forward_emissions_and_tags_size_mismatch() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
+        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu)?;
+        let crf = make_crf(3, false, None, None, None)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1244,33 +1433,34 @@ mod tests {
             result.err().unwrap().to_string(),
             "the first two dimensions of emissions and tags must match, got (1, 2) and (1, 2)"
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L306C9-L306C66
     #[test]
-    fn test_forward_emissions_last_dimension_not_equal_to_number_of_tags() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
-        let tags = Tensor::zeros((1, 2), DType::I64, &Device::Cpu).unwrap();
-        let crf = make_crf(10, false, None, None, None).unwrap();
+    fn test_forward_emissions_last_dimension_not_equal_to_number_of_tags() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
+        let tags = Tensor::zeros((1, 2), DType::I64, &Device::Cpu)?;
+        let crf = make_crf(10, false, None, None, None)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
         assert_eq!(
             result.err().unwrap().to_string(),
             "expected last dimension of emissions is 10, got 3"
-        )
+        );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L315C9-L315C47
     #[test]
-    fn test_forward_first_timestep_mask_is_not_all_on() {
-        let emissions = Tensor::randn(0.0_f64, 1., (3, 2, 4), &Device::Cpu).unwrap();
-        let tags = Tensor::zeros((3, 2), DType::I64, &Device::Cpu).unwrap();
+    fn test_forward_first_timestep_mask_is_not_all_on() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &Device::Cpu)?;
+        let tags = Tensor::zeros((3, 2), DType::I64, &Device::Cpu)?;
         let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)
             .unwrap()
-            .transpose(0, 1)
-            .unwrap();
-        let crf = make_crf(4, false, None, None, None).unwrap();
+            .transpose(0, 1)?;
+        let crf = make_crf(4, false, None, None, None)?;
 
         let result = crf.forward(&emissions, &tags, Some(&mask), Reduction::default());
         println!("{:?}", result);
@@ -1280,10 +1470,10 @@ mod tests {
             "mask of the first timestep must all be on"
         );
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let tags = tags.transpose(0, 1).unwrap();
-        let mask = mask.transpose(0, 1).unwrap();
-        let crf = make_crf(4, true, None, None, None).unwrap();
+        let emissions = emissions.transpose(0, 1)?;
+        let tags = tags.transpose(0, 1)?;
+        let mask = mask.transpose(0, 1)?;
+        let crf = make_crf(4, true, None, None, None)?;
 
         let result = crf.forward(&emissions, &tags, Some(&mask), Reduction::default());
         println!("{:?}", result);
@@ -1292,16 +1482,22 @@ mod tests {
             result.err().unwrap().to_string(),
             "mask of the first timestep must all be on"
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L345
-    #[test]
-    fn test_decode_works_with_mask() {
+    fn decode_works_with_mask(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0548, -0.0239, -0.0291, -0.0208, 0.0665], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[-0.0612, -0.0615, -0.0557, 0.0672, 0.0470], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0548, -0.0239, -0.0291, -0.0208, 0.0665], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[-0.0612, -0.0615, -0.0557, 0.0672, 0.0470], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -1312,11 +1508,10 @@ mod tests {
                         [-0.0168, 0.0871, 0.0489, 0.0019, -0.0548],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1334,25 +1529,37 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)
-            .unwrap()
-            .transpose(0, 1)
-            .unwrap();
-        let best_tags = crf.decode(&emissions, Some(&mask));
+        )?
+        .to_dtype(dtype)?;
+
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let best_tags = crf.decode(&emissions, Some(&mask))?;
         println!("best_tags: {:?}", best_tags);
-        assert_eq!(best_tags.unwrap(), vec![vec![0, 3, 0], vec![2, 2]]);
+        assert_eq!(best_tags, vec![vec![0, 3, 0], vec![2, 2]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_works_with_mask() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            decode_works_with_mask(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L372
-    #[test]
-    fn test_decode_works_without_mask() {
+    fn decode_works_without_mask(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0762, 0.0743, 0.0234, -0.0387, -0.0269], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0102, -0.0137, -0.0149, 0.0700, -0.0701], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[0.0762, 0.0743, 0.0234, -0.0387, -0.0269], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0102, -0.0137, -0.0149, 0.0700, -0.0701], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -1363,11 +1570,10 @@ mod tests {
                         [0.0997, 0.0007, 0.0938, 0.0427, 0.0823],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1385,25 +1591,36 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let best_tags_no_mask = crf.decode(&emissions, None);
+        let best_tags_no_mask = crf.decode(&emissions, None)?;
         println!("best_tags: {:?}", best_tags_no_mask);
-        assert_eq!(
-            best_tags_no_mask.unwrap(),
-            vec![vec![0, 4, 2], vec![0, 2, 1]]
-        )
+        assert_eq!(best_tags_no_mask, vec![vec![0, 4, 2], vec![0, 2, 1]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_works_without_mask() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            decode_works_without_mask(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L384C9-L384C28
-    #[test]
-    fn test_decode_batched_decode() {
+    fn decode_batched_decode(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[-0.0489, 0.0460, -0.0924, -0.0722, 0.0736], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[0.0843, 0.0344, -0.0996, 0.0944, 0.0622], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[-0.0489, 0.0460, -0.0924, -0.0722, 0.0736], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[0.0843, 0.0344, -0.0996, 0.0944, 0.0622], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -1414,11 +1631,10 @@ mod tests {
                         [-0.0492, -0.0953, 0.0862, 0.0580, 0.0422],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1436,52 +1652,51 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)
-            .unwrap()
-            .transpose(0, 1)
-            .unwrap();
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
 
-        let batched = crf.decode(&emissions, Some(&mask));
+        let batched = crf.decode(&emissions, Some(&mask))?;
         println!("batched: {:?}", batched);
 
         let batch_size = 2;
         let mut non_batched = vec![];
         for i in 0..batch_size {
-            let emissions = emissions
-                .i((.., i, ..))
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap()
-                .force_contiguous()
-                .unwrap();
-            let mask = mask
-                .i((.., i))
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap()
-                .force_contiguous()
-                .unwrap();
-            let result = crf.decode(&emissions, Some(&mask)).unwrap();
+            let emissions = emissions.i((.., i, ..))?.unsqueeze(1)?.force_contiguous()?;
+            let mask = mask.i((.., i))?.unsqueeze(1)?.force_contiguous()?;
+
+            let result = crf.decode(&emissions, Some(&mask))?;
             non_batched.push(result[0].clone());
         }
         println!("non_batched: {:?}", non_batched);
 
-        let batched = batched.unwrap();
         assert_eq!(batched, non_batched);
-        assert_eq!(batched, vec![vec![3, 4, 1], vec![0, 4]])
+        assert_eq!(batched, vec![vec![3, 4, 1], vec![0, 4]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_batched_decode() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            decode_batched_decode(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L408
-    #[test]
-    fn test_decode_batch_first() {
+    fn decode_batch_first(dtype: DType) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[-0.0464, 0.0818, 0.0829, -0.0121, -0.0788], &Device::Cpu).unwrap()),
-            Some(Tensor::new(&[-0.0088, 0.0586, 0.0057, 0.0316, -0.0388], &Device::Cpu).unwrap()),
+            Some(
+                Tensor::new(&[-0.0464, 0.0818, 0.0829, -0.0121, -0.0788], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
+            Some(
+                Tensor::new(&[-0.0088, 0.0586, 0.0057, 0.0316, -0.0388], &Device::Cpu)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
@@ -1492,11 +1707,10 @@ mod tests {
                         [-0.0930, -0.0832, 0.0290, 0.0974, 0.0914],
                     ],
                     &Device::Cpu,
-                )
-                .unwrap(),
+                )?
+                .to_dtype(dtype)?,
             ),
-        )
-        .unwrap();
+        )?;
 
         let emissions = Tensor::new(
             &[
@@ -1514,10 +1728,10 @@ mod tests {
                 ],
             ],
             &Device::Cpu,
-        )
-        .unwrap();
+        )?
+        .to_dtype(dtype)?;
 
-        let best_tags = crf.decode(&emissions, None);
+        let best_tags = crf.decode(&emissions, None)?;
         println!("best_tags: {:?}", best_tags);
 
         let crf_bf = make_crf(
@@ -1526,24 +1740,30 @@ mod tests {
             Some(crf.start_transitions),
             Some(crf.end_transitions),
             Some(crf.transitions),
-        )
-        .unwrap();
+        )?;
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let best_tags_bf = crf_bf.decode(&emissions, None);
+        let emissions = emissions.transpose(0, 1)?;
+        let best_tags_bf = crf_bf.decode(&emissions, None)?;
         println!("best_tags_bf: {:?}", best_tags_bf);
 
-        let best_tags = best_tags.unwrap();
-        let best_tags_bf = best_tags_bf.unwrap();
         assert_eq!(best_tags, best_tags_bf);
         assert_eq!(best_tags, vec![vec![1, 3, 0], vec![1, 2, 4]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_batch_first() -> Result<()> {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            decode_batch_first(dtype)?;
+        }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L427
     #[test]
-    fn test_decode_emissions_has_bad_number_of_dimension() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2), &Device::Cpu).unwrap();
-        let crf = make_crf(5, false, None, None, None).unwrap();
+    fn test_decode_emissions_has_bad_number_of_dimension() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &Device::Cpu)?;
+        let crf = make_crf(5, false, None, None, None)?;
         let result = crf.decode(&emissions, None);
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1551,28 +1771,30 @@ mod tests {
             result.err().unwrap().to_string(),
             "emissions must have 3 dimensions, got 2"
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L435
     #[test]
-    fn test_decode_emissions_last_dimension_not_equal_to_number_of_tags() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
-        let crf = make_crf(10, false, None, None, None).unwrap();
+    fn test_decode_emissions_last_dimension_not_equal_to_number_of_tags() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
+        let crf = make_crf(10, false, None, None, None)?;
         let result = crf.decode(&emissions, None);
         println!("{:?}", result);
         assert!(result.is_err());
         assert_eq!(
             result.err().unwrap().to_string(),
             "expected last dimension of emissions is 10, got 3"
-        )
+        );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L443
     #[test]
-    fn test_decode_emissions_and_mask_size_mismatch() {
-        let emissions = Tensor::randn(0.0_f64, 1., (1, 2, 3), &Device::Cpu).unwrap();
-        let mask = Tensor::new(&[[1_u8, 1], [1, 0]], &Device::Cpu).unwrap();
-        let crf = make_crf(3, false, None, None, None).unwrap();
+    fn test_decode_emissions_and_mask_size_mismatch() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
+        let mask = Tensor::new(&[[1_u8, 1], [1, 0]], &Device::Cpu)?;
+        let crf = make_crf(3, false, None, None, None)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1580,17 +1802,16 @@ mod tests {
             result.err().unwrap().to_string(),
             "the first two dimensions of emissions and mask must match, got (1, 2) and (2, 2)"
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L454
     #[test]
-    fn test_decode_first_timestep_mask_is_not_all_on() {
-        let emissions = Tensor::randn(0.0_f64, 1., (3, 2, 4), &Device::Cpu).unwrap();
-        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)
-            .unwrap()
-            .transpose(0, 1)
-            .unwrap();
-        let crf = make_crf(4, false, None, None, None).unwrap();
+    fn test_decode_first_timestep_mask_is_not_all_on() -> Result<()> {
+        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &Device::Cpu)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)?.transpose(0, 1)?;
+
+        let crf = make_crf(4, false, None, None, None)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1599,9 +1820,9 @@ mod tests {
             "mask of the first timestep must all be on"
         );
 
-        let emissions = emissions.transpose(0, 1).unwrap();
-        let mask = mask.transpose(0, 1).unwrap();
-        let crf = make_crf(4, true, None, None, None).unwrap();
+        let emissions = emissions.transpose(0, 1)?;
+        let mask = mask.transpose(0, 1)?;
+        let crf = make_crf(4, true, None, None, None)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1609,5 +1830,6 @@ mod tests {
             result.err().unwrap().to_string(),
             "mask of the first timestep must all be on"
         );
+        Ok(())
     }
 }
