@@ -9,8 +9,8 @@ license-file = "LICENSE"
 keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
-candle-core = "0.6.0"
-candle-nn = "0.6.0"
+candle-core = { path ="../candle/candle-core" }
+candle-nn = { path ="../candle/candle-nn" }
 
 [dev-dependencies]
 itertools = "0.13.0"

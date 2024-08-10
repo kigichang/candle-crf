@@ -1,4 +1,5 @@
 use candle_core::{shape::Dim, DType, Device, Error, IndexOp, Result, Tensor, D};
+use candle_nn::{Init, VarBuilder};
 use std::fmt::Display;
 
 /// Reduction Type
@@ -69,6 +70,43 @@ impl CRF {
         let end_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
         let transitions =
             Tensor::zeros((num_tags, num_tags), dtype, &device)?.rand_like(-0.1, 1.0)?;
+
+        Ok(Self {
+            num_tags,
+            batch_first,
+            start_transitions,
+            end_transitions,
+            transitions,
+        })
+    }
+
+    pub fn load(num_tags: usize, batch_first: bool, vb: VarBuilder) -> Result<Self> {
+        let start_transitions = vb.get_with_hints(
+            num_tags,
+            "start_transitions",
+            Init::Uniform {
+                lo: -0.1_f64,
+                up: 1.0_f64,
+            },
+        )?;
+
+        let end_transitions = vb.get_with_hints(
+            num_tags,
+            "end_transitions",
+            Init::Uniform {
+                lo: -0.1_f64,
+                up: 1.0_f64,
+            },
+        )?;
+
+        let transitions = vb.get_with_hints(
+            (num_tags, num_tags),
+            "transitions",
+            Init::Uniform {
+                lo: -0.1_f64,
+                up: 1.0_f64,
+            },
+        )?;
 
         Ok(Self {
             num_tags,
