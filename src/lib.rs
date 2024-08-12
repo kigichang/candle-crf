@@ -991,12 +991,12 @@ mod tests {
         for i in 0..batch_size {
             let emissions = emissions
                 .i((.., i, ..))?
-                .force_contiguous()? // force contiguous to fix tensor indexer.
+                .contiguous()? // force contiguous to fix tensor indexer.
                 .unsqueeze(1)?;
 
             let tags = tags
                 .i((.., i))?
-                .force_contiguous()? // force contiguous to fix tensor indexer.
+                .contiguous()? // force contiguous to fix tensor indexer.
                 .unsqueeze(1)?;
 
             total_llh = total_llh.broadcast_add(&crf.forward(
@@ -1701,8 +1701,8 @@ mod tests {
         let batch_size = 2;
         let mut non_batched = vec![];
         for i in 0..batch_size {
-            let emissions = emissions.i((.., i, ..))?.unsqueeze(1)?.force_contiguous()?;
-            let mask = mask.i((.., i))?.unsqueeze(1)?.force_contiguous()?;
+            let emissions = emissions.i((.., i, ..))?.unsqueeze(1)?.contiguous()?;
+            let mask = mask.i((.., i))?.unsqueeze(1)?.contiguous()?;
 
             let result = crf.decode(&emissions, Some(&mask))?;
             non_batched.push(result[0].clone());
