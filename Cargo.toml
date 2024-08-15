@@ -9,8 +9,8 @@ license-file = "LICENSE"
 keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
-candle-core = "0.6.0"
-candle-nn = "0.6.0"
+candle-core = { git="https://github.com/huggingface/candle", branch="main" }
+candle-nn = { git="https://github.com/huggingface/candle", branch="main" }
 
 [dev-dependencies]
 itertools = "0.13.0"
