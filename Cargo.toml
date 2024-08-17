@@ -1,6 +1,6 @@
 [package]
 name = "candle-crf"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 description = "porting pytorch-crf to candle"
 readme = "README.md"
@@ -9,9 +9,17 @@ license-file = "LICENSE"
 keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
+accelerate-src = { version = "0.3.2", optional = true }
+intel-mkl-src = { version = "0.8.1", optional = true }
 candle-core = "0.6.0"
 candle-nn = "0.6.0"
+
 
 [dev-dependencies]
 itertools = "0.13.0"
 tuple-conv = "1.0.1"
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
+mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
