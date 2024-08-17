@@ -1,3 +1,9 @@
+#[cfg(feature = "accelerate")]
+extern crate accelerate_src;
+
+#[cfg(feature = "mkl")]
+extern crate intel_mkl_src;
+
 use candle_core::{shape::Dim, DType, Device, Error, IndexOp, Result, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 use std::fmt::Display;
