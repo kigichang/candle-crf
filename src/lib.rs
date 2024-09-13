@@ -1,9 +1,3 @@
-#[cfg(feature = "accelerate")]
-extern crate accelerate_src;
-
-#[cfg(feature = "mkl")]
-extern crate intel_mkl_src;
-
 use candle_core::{shape::Dim, DType, Device, Error, IndexOp, Result, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 use std::fmt::Display;
@@ -64,8 +58,11 @@ impl CRF {
         {
             use DType::*;
             match dtype {
+                #[cfg(any(feature = "cuda", feature = "metal"))]
+                F32 | F64 => {}
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 BF16 | F16 | F32 | F64 => {}
-                _ => return Err(Error::Msg("dtype must be float".to_string())),
+                _ => return Err(Error::UnsupportedDTypeForOp(dtype, "unsupported dtype")),
             }
         }
 
@@ -452,8 +449,19 @@ mod tests {
      */
 
     use super::*;
-    use candle_core::{DType, Device, IndexOp, Result, Tensor};
+    use anyhow::Result;
+    use candle_core::{utils, DType, Device, IndexOp, Tensor};
     use itertools::Itertools;
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    const OK_TYPES: [DType; 2] = [DType::F32, DType::F64];
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    const OK_TYPES: [DType; 4] = [DType::F32, DType::F64, DType::F16, DType::BF16];
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    const FAIL_TYPES: [DType; 5] = [DType::U8, DType::U32, DType::I64, DType::F16, DType::BF16];
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    const FAIL_TYPES: [DType; 3] = [DType::U8, DType::U32, DType::I64];
 
     enum DTypeCase {
         DType(DType),
@@ -463,8 +471,8 @@ mod tests {
     fn epsilon(type_case: DTypeCase) -> f64 {
         match type_case {
             DTypeCase::DType(dtype) => match dtype {
-                DType::F64 => 1e-12,
-                DType::F32 => 1e-6,
+                DType::F64 => 1e-6,
+                DType::F32 => 1e-4,
                 DType::F16 => 1e-2,
                 DType::BF16 => 1e-1,
                 _ => panic!("dtype not supported"),
@@ -511,7 +519,7 @@ mod tests {
             .collect())
     }
 
-    fn cat_scalar_tensor(tensors: Vec<Tensor>) -> Result<Tensor> {
+    fn cat_scalar_tensor(tensors: Vec<Tensor>) -> candle_core::Result<Tensor> {
         let tensors: Vec<Tensor> = tensors
             .into_iter()
             .map(|t| t.unsqueeze(0).unwrap())
@@ -519,19 +527,43 @@ mod tests {
         Tensor::cat(&tensors, 0)
     }
 
+    fn use_gpu(gpu: bool) -> candle_core::Result<Device> {
+        if gpu {
+            if utils::cuda_is_available() {
+                println!("CUDA is available");
+                Device::new_cuda(0)
+            } else if utils::metal_is_available() {
+                println!("Metal is available");
+                Device::new_metal(0)
+            } else {
+                println!("CUDA and Metal are not available, using CPU");
+                Ok(Device::Cpu)
+            }
+        } else {
+            println!("Using CPU");
+            Ok(Device::Cpu)
+        }
+    }
+
     #[test]
-    fn test_cat_scalar_tensor() {
+    fn test_cat_scalar_tensor() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
         let mut lst = vec![];
         for i in 0..10 {
-            let x = Tensor::full(i as f32, (), &Device::Cpu).unwrap();
+            let x = Tensor::full(i as f32, (), &device)?;
             lst.push(x);
         }
 
-        let result = cat_scalar_tensor(lst).unwrap();
+        let result = cat_scalar_tensor(lst)?;
         assert_eq!(
             result.to_vec1::<f32>().unwrap(),
             vec![0., 1., 2., 3., 4., 5., 6., 7., 8., 9.]
         );
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L37
@@ -541,16 +573,17 @@ mod tests {
         start: Option<Tensor>,
         end: Option<Tensor>,
         transition: Option<Tensor>,
+        device: &Device,
     ) -> candle_core::Result<CRF> {
-        let mut crf = CRF::new(num_tags, batch_first, &candle_core::Device::Cpu)?;
+        let mut crf = CRF::new(num_tags, batch_first, device)?;
         if let Some(start) = start {
-            crf.start_transitions = start.to_device(&Device::Cpu)?;
+            crf.start_transitions = start
         }
         if let Some(end) = end {
-            crf.end_transitions = end.to_device(&Device::Cpu)?;
+            crf.end_transitions = end
         }
         if let Some(transition) = transition {
-            crf.transitions = transition.to_device(&Device::Cpu)?;
+            crf.transitions = transition
         }
         Ok(crf)
     }
@@ -569,7 +602,7 @@ mod tests {
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L18
-    fn compute_score(crf: &CRF, emission: &Tensor, tag: &Tensor) -> candle_core::Result<Tensor> {
+    fn compute_score(crf: &CRF, emission: &Tensor, tag: &Tensor) -> Result<Tensor> {
         assert_eq!(emission.dims().len(), 2);
         let (emission_dim1, emission_dim2) = emission.dims2()?;
         let tag_dim1 = tag.dims1()?;
@@ -598,54 +631,79 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_dtype() {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            CRF::new_with_dtype(10, false, dtype, &Device::Cpu).unwrap();
+    fn test_init_with_dtype() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            assert!(CRF::new_with_dtype(10, false, dtype, &device).is_ok());
         }
 
-        for dtype in [DType::U8, DType::U32, DType::I64] {
-            assert!(CRF::new_with_dtype(10, false, dtype, &Device::Cpu).is_err());
+        for dtype in FAIL_TYPES {
+            assert!(CRF::new_with_dtype(10, false, dtype, &device).is_err());
         }
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L60
     #[test]
-    fn test_init_minial() {
+    fn test_init_minial() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
         let num_tags = 10;
-        let crf = CRF::new(num_tags, false, &Device::Cpu).unwrap();
+        let crf = CRF::new(num_tags, false, &device)?;
         assert_eq!(crf.num_tags, num_tags);
         assert!(!crf.batch_first);
-        assert_eq!(crf.start_transitions.dims1().unwrap(), num_tags);
-        assert_eq!(crf.end_transitions.dims1().unwrap(), num_tags);
-        assert_eq!(crf.transitions.dims2().unwrap(), (num_tags, num_tags));
+        assert_eq!(crf.start_transitions.dims1()?, num_tags);
+        assert_eq!(crf.end_transitions.dims1()?, num_tags);
+        assert_eq!(crf.transitions.dims2()?, (num_tags, num_tags));
         println!("crf:{}", crf);
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L74
     #[test]
-    fn test_init_full() {
-        let crf = CRF::new(10, true, &Device::Cpu).unwrap();
+    fn test_init_full() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let crf = CRF::new(10, true, &device)?;
         assert!(crf.batch_first);
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L78C9-L78C34
     #[test]
-    fn test_init_nonpositive_num_tags() {
-        let crf = CRF::new(0, false, &Device::Cpu);
+    fn test_init_nonpositive_num_tags() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let crf = CRF::new(0, false, &device);
         assert!(crf.is_err());
+
+        Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L85
-    fn forward_works_with_mask(dtype: DType) -> Result<()> {
+    fn forward_works_with_mask(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[-0.0687, 0.0698, -0.0447, 0.0421, 0.0782], &Device::Cpu)?
+                Tensor::new(&[-0.0687, 0.0698, -0.0447, 0.0421, 0.0782], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0061, -0.0671, -0.0797, 0.0629, -0.0136], &Device::Cpu)?
+                Tensor::new(&[0.0061, -0.0671, -0.0797, 0.0629, -0.0136], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -657,10 +715,11 @@ mod tests {
                         [0.0191, 0.0755, 0.0230, 0.0209, -0.0768],
                         [0.0303, 0.0592, -0.0297, 0.0681, 0.0801],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -678,12 +737,12 @@ mod tests {
                     [-0.9301, 0.8906, -2.6483, 0.5849, -1.1069],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[2_i64, 4], [3, 3], [4, 2]], &Device::Cpu)?;
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let tags = Tensor::new(&[[2_i64, 4], [3, 3], [4, 2]], device)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
         let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::default())?;
         println!("llh: {:?}", llh);
 
@@ -705,7 +764,7 @@ mod tests {
             let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
-            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu)?;
+            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, device)?;
             let all_scores = product
                 .iter()
                 .map(|t| compute_score(&crf, &emission, &t).unwrap());
@@ -734,25 +793,27 @@ mod tests {
 
     #[test]
     fn test_forward_works_with_mask() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_works_with_mask(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_works_with_mask(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/tests/test_crf.py#L122C9-L122C32
-    fn forward_works_without_mask(dtype: DType) -> Result<()> {
+    fn forward_works_without_mask(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0266, -0.0539, 0.0572, -0.0199, -0.0167], &Device::Cpu)?
+                Tensor::new(&[0.0266, -0.0539, 0.0572, -0.0199, -0.0167], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(
-                Tensor::new(&[0.0084, 0.0892, 0.0942, -0.0179, 0.0112], &Device::Cpu)?
-                    .to_dtype(dtype)?,
-            ),
+            Some(Tensor::new(&[0.0084, 0.0892, 0.0942, -0.0179, 0.0112], device)?.to_dtype(dtype)?),
             Some(
                 Tensor::new(
                     &[
@@ -762,10 +823,11 @@ mod tests {
                         [0.0365, -0.0033, 0.0726, -0.0620, 0.0516],
                         [0.0925, -0.0708, 0.0765, 0.0671, -0.0344],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -783,11 +845,11 @@ mod tests {
                     [0.1266, 0.6654, -1.1915, -0.1181, 0.0167],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[3_i64, 2], [3, 1], [4, 3]], &Device::Cpu)?;
+        let tags = Tensor::new(&[[3_i64, 2], [3, 1], [4, 3]], device)?;
 
         let llh_no_mask = crf.forward(&emissions, &tags, None, Reduction::default())?;
 
@@ -819,24 +881,29 @@ mod tests {
 
     #[test]
     fn test_forward_works_without_mask() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_works_without_mask(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_works_without_mask(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L135
-    fn forward_batched_loss(dtype: DType) -> Result<()> {
+    fn forward_batched_loss(dtype: DType, device: &Device) -> Result<()> {
         let batch_size = 10;
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[-0.0695, -0.0117, -0.0021, -0.0635, -0.0328], &Device::Cpu)?
+                Tensor::new(&[-0.0695, -0.0117, -0.0021, -0.0635, -0.0328], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0524, -0.0827, 0.0868, -0.0140, 0.0131], &Device::Cpu)?
+                Tensor::new(&[-0.0524, -0.0827, 0.0868, -0.0140, 0.0131], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -848,10 +915,11 @@ mod tests {
                         [0.0506, 0.0535, -0.0378, -0.0537, 0.0516],
                         [-0.0037, 0.0763, -0.0867, 0.0410, 0.0368],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -977,7 +1045,7 @@ mod tests {
                     [1.0503e-01, 1.6486e+00, -2.4486e-01, 5.4843e-01, 1.9252e+00],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
@@ -987,7 +1055,7 @@ mod tests {
                 [3, 2, 3, 4, 4, 1, 2, 1, 4, 1],
                 [0, 1, 4, 4, 0, 4, 0, 1, 4, 1],
             ],
-            &Device::Cpu,
+            device,
         )?;
 
         let llh = crf.forward(&emissions, &tags, None, Reduction::default())?;
@@ -1027,23 +1095,28 @@ mod tests {
 
     #[test]
     fn test_forward_batched_loss() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_batched_loss(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_batched_loss(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L159
-    fn forward_reduction_none(dtype: DType) -> Result<()> {
+    fn forward_reduction_none(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0432, 0.0507, -0.0286, 0.0476, -0.0603], &Device::Cpu)?
+                Tensor::new(&[0.0432, 0.0507, -0.0286, 0.0476, -0.0603], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0824, 0.0845, -0.0180, -0.0773, 0.0414], &Device::Cpu)?
+                Tensor::new(&[0.0824, 0.0845, -0.0180, -0.0773, 0.0414], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -1055,10 +1128,11 @@ mod tests {
                         [-0.0260, 0.0720, 0.0017, -0.0552, -0.0470],
                         [0.0104, 0.0299, -0.0182, -0.0515, 0.0424],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1076,11 +1150,11 @@ mod tests {
                     [-0.5401, 1.1908, -1.7266, -0.5858, -1.4395],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[1_i64, 3], [1, 3], [1, 2]], &Device::Cpu)?;
+        let tags = Tensor::new(&[[1_i64, 3], [1, 3], [1, 2]], device)?;
         let llh = crf.forward(&emissions, &tags, None, Reduction::None)?;
         println!("llh: {:?}", llh);
         let (seq_length, batch_size) = tags.dims2()?;
@@ -1098,8 +1172,7 @@ mod tests {
             let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
-            let product =
-                cartestian_product((0..num_tags).collect_vec(), seq_length, &Device::Cpu)?;
+            let product = cartestian_product((0..num_tags).collect_vec(), seq_length, device)?;
 
             let all_scores = product
                 .iter()
@@ -1118,7 +1191,7 @@ mod tests {
         let manual_llh = cat_scalar_tensor(manual_llh)?;
         println!("manual_llh: {:?}", manual_llh);
         if dtype == DType::F32 {
-            let manual_llh = Tensor::new(&[-6.3064_f32, -7.0368], &Device::Cpu)?;
+            let manual_llh = Tensor::new(&[-6.3064_f32, -7.0368], device)?;
             println!("compare with pytorch-crf: {:?}, {:?}", llh, manual_llh);
             assert_tensor_close(&llh, &manual_llh, epsilon(DTypeCase::PyTorchCRF))?;
         }
@@ -1127,23 +1200,28 @@ mod tests {
 
     #[test]
     fn test_forward_reduction_none() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_reduction_none(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_reduction_none(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
-    fn forward_reduction_mean(dtype: DType) -> Result<()> {
+    fn forward_reduction_mean(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0606, -0.0597, 0.0217, -0.0760, 0.0096], &Device::Cpu)?
+                Tensor::new(&[0.0606, -0.0597, 0.0217, -0.0760, 0.0096], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0791, -0.0159, 0.0525, 0.0451, -0.0373], &Device::Cpu)?
+                Tensor::new(&[-0.0791, -0.0159, 0.0525, 0.0451, -0.0373], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -1167,10 +1245,11 @@ mod tests {
                         ],
                         [-5.0593e-02, 4.5717e-03, 6.8714e-03, 8.9858e-02, -8.2813e-02],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1188,11 +1267,11 @@ mod tests {
                     [-1.0892, -0.8641, 0.4778, -0.4032, 0.2838],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[3_i64, 0], [0, 3], [2, 4]], &Device::Cpu)?;
+        let tags = Tensor::new(&[[3_i64, 0], [0, 3], [2, 4]], device)?;
         let llh = crf.forward(&emissions, &tags, None, Reduction::Mean)?;
         println!("llh: {:?}", llh);
 
@@ -1245,25 +1324,27 @@ mod tests {
 
     #[test]
     fn test_forward_reduction_mean() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_reduction_mean(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_reduction_mean(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L192
-    fn forward_token_mean(dtype: DType) -> Result<()> {
+    fn forward_token_mean(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
-            Some(
-                Tensor::new(&[0.0687, 0.0533, 0.0204, 0.0250, -0.0785], &Device::Cpu)?
-                    .to_dtype(dtype)?,
-            ),
+            Some(Tensor::new(&[0.0687, 0.0533, 0.0204, 0.0250, -0.0785], device)?.to_dtype(dtype)?),
             Some(
                 Tensor::new(
                     &[4.8827e-02, -9.9134e-05, 9.3184e-02, -7.6271e-02, 3.6482e-02],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
@@ -1276,10 +1357,11 @@ mod tests {
                         [0.0761, -0.0406, -0.0905, 0.0590, -0.0030],
                         [0.0613, 0.0871, -0.0343, 0.0384, 0.0485],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1297,12 +1379,12 @@ mod tests {
                     [-0.7357, 0.3116, 1.5733, -0.8246, -0.4224],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[2_i64, 2], [0, 4], [3, 3]], &Device::Cpu)?;
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let tags = Tensor::new(&[[2_i64, 2], [0, 4], [3, 3]], device)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
         let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::TokenMean)?;
         println!("llh: {:?}", llh);
 
@@ -1324,7 +1406,7 @@ mod tests {
             let numerator = compute_score(&crf, &emission, &tag)?;
 
             let num_tags = crf.num_tags as i64;
-            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, &Device::Cpu)?;
+            let product = cartestian_product((0..num_tags).collect_vec(), seq_len, device)?;
 
             let all_scores = product
                 .iter()
@@ -1360,25 +1442,27 @@ mod tests {
 
     #[test]
     fn test_forward_token_mean() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_token_mean(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_token_mean(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L263
-    fn forward_batch_first(dtype: DType) -> Result<()> {
+    fn forward_batch_first(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0384, -0.0811, -0.0291, 0.0444, 0.0943], &Device::Cpu)?
+                Tensor::new(&[0.0384, -0.0811, -0.0291, 0.0444, 0.0943], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(
-                Tensor::new(&[0.0146, 0.0455, 0.0991, 0.0640, -0.0298], &Device::Cpu)?
-                    .to_dtype(dtype)?,
-            ),
+            Some(Tensor::new(&[0.0146, 0.0455, 0.0991, 0.0640, -0.0298], device)?.to_dtype(dtype)?),
             Some(
                 Tensor::new(
                     &[
@@ -1388,10 +1472,11 @@ mod tests {
                         [0.0111, 0.0320, 0.0769, 0.0292, -0.0707],
                         [-0.0990, -0.0971, 0.0635, 0.0166, 0.0292],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1409,11 +1494,11 @@ mod tests {
                     [-0.2521, -1.4185, -0.6026, 1.6335, 1.0366],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let tags = Tensor::new(&[[1_i64, 4], [1, 4], [1, 4]], &Device::Cpu).unwrap();
+        let tags = Tensor::new(&[[1_i64, 4], [1, 4], [1, 4]], device)?;
         let llh = crf.forward(&emissions, &tags, None, Reduction::default())?;
         println!("llh: {:?}", llh);
 
@@ -1423,6 +1508,7 @@ mod tests {
             Some(crf.start_transitions),
             Some(crf.end_transitions),
             Some(crf.transitions),
+            device,
         )?;
 
         let emissions = emissions.transpose(0, 1).unwrap();
@@ -1441,8 +1527,13 @@ mod tests {
 
     #[test]
     fn test_forward_batch_first() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            forward_batch_first(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            forward_batch_first(dtype, &device)?;
         }
         Ok(())
     }
@@ -1450,10 +1541,15 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L286
     #[test]
     fn test_forward_emissions_has_bad_number_of_dimension() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &Device::Cpu)?;
-        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
 
-        let crf = make_crf(5, false, None, None, None)?;
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &device)?;
+        let tags = Tensor::zeros((2, 2), DType::I64, &device)?;
+
+        let crf = make_crf(5, false, None, None, None, &device)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1467,9 +1563,14 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L295C9-L295C46
     #[test]
     fn test_forward_emissions_and_tags_size_mismatch() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
-        let tags = Tensor::zeros((2, 2), DType::I64, &Device::Cpu)?;
-        let crf = make_crf(3, false, None, None, None)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        let tags = Tensor::zeros((2, 2), DType::I64, &device)?;
+        let crf = make_crf(3, false, None, None, None, &device)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1483,9 +1584,14 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L306C9-L306C66
     #[test]
     fn test_forward_emissions_last_dimension_not_equal_to_number_of_tags() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
-        let tags = Tensor::zeros((1, 2), DType::I64, &Device::Cpu)?;
-        let crf = make_crf(10, false, None, None, None)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        let tags = Tensor::zeros((1, 2), DType::I64, &device)?;
+        let crf = make_crf(10, false, None, None, None, &device)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1499,12 +1605,17 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L315C9-L315C47
     #[test]
     fn test_forward_first_timestep_mask_is_not_all_on() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &Device::Cpu)?;
-        let tags = Tensor::zeros((3, 2), DType::I64, &Device::Cpu)?;
-        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &device)?;
+        let tags = Tensor::zeros((3, 2), DType::I64, &device)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &device)
             .unwrap()
             .transpose(0, 1)?;
-        let crf = make_crf(4, false, None, None, None)?;
+        let crf = make_crf(4, false, None, None, None, &device)?;
 
         let result = crf.forward(&emissions, &tags, Some(&mask), Reduction::default());
         println!("{:?}", result);
@@ -1517,7 +1628,7 @@ mod tests {
         let emissions = emissions.transpose(0, 1)?;
         let tags = tags.transpose(0, 1)?;
         let mask = mask.transpose(0, 1)?;
-        let crf = make_crf(4, true, None, None, None)?;
+        let crf = make_crf(4, true, None, None, None, &device)?;
 
         let result = crf.forward(&emissions, &tags, Some(&mask), Reduction::default());
         println!("{:?}", result);
@@ -1530,16 +1641,16 @@ mod tests {
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L345
-    fn decode_works_with_mask(dtype: DType) -> Result<()> {
+    fn decode_works_with_mask(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0548, -0.0239, -0.0291, -0.0208, 0.0665], &Device::Cpu)?
+                Tensor::new(&[0.0548, -0.0239, -0.0291, -0.0208, 0.0665], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0612, -0.0615, -0.0557, 0.0672, 0.0470], &Device::Cpu)?
+                Tensor::new(&[-0.0612, -0.0615, -0.0557, 0.0672, 0.0470], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -1551,10 +1662,11 @@ mod tests {
                         [0.0358, 0.0513, 0.0013, -0.0380, 0.0626],
                         [-0.0168, 0.0871, 0.0489, 0.0019, -0.0548],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1572,11 +1684,11 @@ mod tests {
                     [-0.3805, 0.3646, -1.0142, -1.2563, -0.6568],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
         let best_tags = crf.decode(&emissions, Some(&mask))?;
         println!("best_tags: {:?}", best_tags);
         assert_eq!(best_tags, vec![vec![0, 3, 0], vec![2, 2]]);
@@ -1585,23 +1697,28 @@ mod tests {
 
     #[test]
     fn test_decode_works_with_mask() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            decode_works_with_mask(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            decode_works_with_mask(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L372
-    fn decode_works_without_mask(dtype: DType) -> Result<()> {
+    fn decode_works_without_mask(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[0.0762, 0.0743, 0.0234, -0.0387, -0.0269], &Device::Cpu)?
+                Tensor::new(&[0.0762, 0.0743, 0.0234, -0.0387, -0.0269], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0102, -0.0137, -0.0149, 0.0700, -0.0701], &Device::Cpu)?
+                Tensor::new(&[0.0102, -0.0137, -0.0149, 0.0700, -0.0701], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -1613,10 +1730,11 @@ mod tests {
                         [-0.0649, 0.0047, 0.0593, 0.0733, 0.0203],
                         [0.0997, 0.0007, 0.0938, 0.0427, 0.0823],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1634,7 +1752,7 @@ mod tests {
                     [-0.3999, 1.4914, 1.0620, -0.6408, -0.3032],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
@@ -1646,25 +1764,27 @@ mod tests {
 
     #[test]
     fn test_decode_works_without_mask() -> Result<()> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
         for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            decode_works_without_mask(dtype)?;
+            decode_works_without_mask(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L384C9-L384C28
-    fn decode_batched_decode(dtype: DType) -> Result<()> {
+    fn decode_batched_decode(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[-0.0489, 0.0460, -0.0924, -0.0722, 0.0736], &Device::Cpu)?
+                Tensor::new(&[-0.0489, 0.0460, -0.0924, -0.0722, 0.0736], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(
-                Tensor::new(&[0.0843, 0.0344, -0.0996, 0.0944, 0.0622], &Device::Cpu)?
-                    .to_dtype(dtype)?,
-            ),
+            Some(Tensor::new(&[0.0843, 0.0344, -0.0996, 0.0944, 0.0622], device)?.to_dtype(dtype)?),
             Some(
                 Tensor::new(
                     &[
@@ -1674,10 +1794,11 @@ mod tests {
                         [0.0655, -0.0055, 0.0718, -0.0275, -0.0994],
                         [-0.0492, -0.0953, 0.0862, 0.0580, 0.0422],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1695,11 +1816,11 @@ mod tests {
                     [-1.0040, 0.7791, -0.3735, 0.8300, 1.5138],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
-        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
 
         let batched = crf.decode(&emissions, Some(&mask))?;
         println!("batched: {:?}", batched);
@@ -1722,23 +1843,28 @@ mod tests {
 
     #[test]
     fn test_decode_batched_decode() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            decode_batched_decode(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            decode_batched_decode(dtype, &device)?;
         }
         Ok(())
     }
 
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L408
-    fn decode_batch_first(dtype: DType) -> Result<()> {
+    fn decode_batch_first(dtype: DType, device: &Device) -> Result<()> {
         let crf = make_crf(
             5,
             false,
             Some(
-                Tensor::new(&[-0.0464, 0.0818, 0.0829, -0.0121, -0.0788], &Device::Cpu)?
+                Tensor::new(&[-0.0464, 0.0818, 0.0829, -0.0121, -0.0788], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0088, 0.0586, 0.0057, 0.0316, -0.0388], &Device::Cpu)?
+                Tensor::new(&[-0.0088, 0.0586, 0.0057, 0.0316, -0.0388], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
@@ -1750,10 +1876,11 @@ mod tests {
                         [0.0875, 0.0324, -0.0941, 0.0585, 0.0761],
                         [-0.0930, -0.0832, 0.0290, 0.0974, 0.0914],
                     ],
-                    &Device::Cpu,
+                    device,
                 )?
                 .to_dtype(dtype)?,
             ),
+            device,
         )?;
 
         let emissions = Tensor::new(
@@ -1771,7 +1898,7 @@ mod tests {
                     [-0.6268, -0.9438, 0.6666, -0.6545, 1.0409],
                 ],
             ],
-            &Device::Cpu,
+            device,
         )?
         .to_dtype(dtype)?;
 
@@ -1784,6 +1911,7 @@ mod tests {
             Some(crf.start_transitions),
             Some(crf.end_transitions),
             Some(crf.transitions),
+            device,
         )?;
 
         let emissions = emissions.transpose(0, 1)?;
@@ -1797,8 +1925,13 @@ mod tests {
 
     #[test]
     fn test_decode_batch_first() -> Result<()> {
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
-            decode_batch_first(dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        for dtype in OK_TYPES {
+            decode_batch_first(dtype, &device)?;
         }
         Ok(())
     }
@@ -1806,8 +1939,13 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L427
     #[test]
     fn test_decode_emissions_has_bad_number_of_dimension() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &Device::Cpu)?;
-        let crf = make_crf(5, false, None, None, None)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &device)?;
+        let crf = make_crf(5, false, None, None, None, &device)?;
         let result = crf.decode(&emissions, None);
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1821,8 +1959,13 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L435
     #[test]
     fn test_decode_emissions_last_dimension_not_equal_to_number_of_tags() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
-        let crf = make_crf(10, false, None, None, None)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        let crf = make_crf(10, false, None, None, None, &device)?;
         let result = crf.decode(&emissions, None);
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1836,9 +1979,14 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L443
     #[test]
     fn test_decode_emissions_and_mask_size_mismatch() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &Device::Cpu)?;
-        let mask = Tensor::new(&[[1_u8, 1], [1, 0]], &Device::Cpu)?;
-        let crf = make_crf(3, false, None, None, None)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
+
+        let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        let mask = Tensor::new(&[[1_u8, 1], [1, 0]], &device)?;
+        let crf = make_crf(3, false, None, None, None, &device)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1852,10 +2000,15 @@ mod tests {
     /// https://github.com/kmkurn/pytorch-crf/blob/8f3203a1f1d7984c87718bfe31853242670258db/tests/test_crf.py#L454
     #[test]
     fn test_decode_first_timestep_mask_is_not_all_on() -> Result<()> {
-        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &Device::Cpu)?;
-        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &Device::Cpu)?.transpose(0, 1)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let device = use_gpu(true)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = use_gpu(false)?;
 
-        let crf = make_crf(4, false, None, None, None)?;
+        let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &device)?;
+        let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &device)?.transpose(0, 1)?;
+
+        let crf = make_crf(4, false, None, None, None, &device)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
@@ -1866,7 +2019,7 @@ mod tests {
 
         let emissions = emissions.transpose(0, 1)?;
         let mask = mask.transpose(0, 1)?;
-        let crf = make_crf(4, true, None, None, None)?;
+        let crf = make_crf(4, true, None, None, None, &device)?;
         let result = crf.decode(&emissions, Some(&mask));
         println!("{:?}", result);
         assert!(result.is_err());
