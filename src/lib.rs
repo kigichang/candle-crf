@@ -58,7 +58,9 @@ impl CRF {
         {
             use DType::*;
             match dtype {
-                #[cfg(any(feature = "cuda", feature = "metal"))]
+                #[cfg(feature = "metal")]
+                F32 => {}
+                #[cfg(feature = "cuda")]
                 F32 | F64 => {}
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 BF16 | F16 | F32 | F64 => {}
@@ -69,6 +71,7 @@ impl CRF {
         if num_tags == 0 {
             return Err(Error::Msg("num_tags must be greater than 0".to_string()));
         }
+
         let start_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
         let end_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
         let transitions =
@@ -453,12 +456,23 @@ mod tests {
     use candle_core::{utils, DType, Device, IndexOp, Tensor};
     use itertools::Itertools;
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
+    const OK_TYPES: [DType; 1] = [DType::F32];
+    #[cfg(feature = "cuda")]
     const OK_TYPES: [DType; 2] = [DType::F32, DType::F64];
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     const OK_TYPES: [DType; 4] = [DType::F32, DType::F64, DType::F16, DType::BF16];
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
+    const FAIL_TYPES: [DType; 6] = [
+        DType::U8,
+        DType::U32,
+        DType::I64,
+        DType::F16,
+        DType::BF16,
+        DType::F64,
+    ];
+    #[cfg(feature = "cuda")]
     const FAIL_TYPES: [DType; 5] = [DType::U8, DType::U32, DType::I64, DType::F16, DType::BF16];
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     const FAIL_TYPES: [DType; 3] = [DType::U8, DType::U32, DType::I64];
