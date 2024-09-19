@@ -164,6 +164,12 @@ impl CRF {
         }
 
         if let Some(tags) = tags {
+            #[cfg(feature = "metal")]
+            if tags.dtype() != DType::U32 {
+                return Err(Error::Msg("tags must be of type u32".to_string()));
+            }
+
+            #[cfg(not(feature = "metal"))]
             if tags.dtype() != DType::I64 {
                 return Err(Error::Msg("tags must be of type i64".to_string()));
             }
@@ -251,10 +257,23 @@ impl CRF {
             .sum(0)?
             .broadcast_sub(&Tensor::ones(1, DType::I64, mask.device())?)?;
 
+        #[cfg(feature = "metal")]
+        let last_tags = {
+            let tags2 = tags.to_dtype(DType::F32)?;
+            gather(
+                &tags2.i(&seq_ends)?,
+                &Tensor::arange(0, batch_size as u32, mask.device())?,
+            )?
+        };
+
+        #[cfg(not(feature = "metal"))]
         let last_tags = gather(
             &tags.i(&seq_ends)?,
             &Tensor::arange(0, batch_size as i64, mask.device())?,
         )?;
+
+        #[cfg(feature = "metal")]
+        let last_tags = last_tags.to_dtype(DType::U32)?;
 
         score.broadcast_add(&self.end_transitions.i(&last_tags)?)
     }
@@ -482,6 +501,21 @@ mod tests {
         PyTorchCRF,
     }
 
+    #[cfg(feature = "metal")]
+    fn epsilon(type_case: DTypeCase) -> f32 {
+        match type_case {
+            DTypeCase::DType(dtype) => match dtype {
+                DType::F64 => 1e-6,
+                DType::F32 => 1e-4,
+                DType::F16 => 1e-2,
+                DType::BF16 => 1e-1,
+                _ => panic!("dtype not supported"),
+            },
+            DTypeCase::PyTorchCRF => 1e-3,
+        }
+    }
+
+    #[cfg(not(feature = "metal"))]
     fn epsilon(type_case: DTypeCase) -> f64 {
         match type_case {
             DTypeCase::DType(dtype) => match dtype {
@@ -495,6 +529,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "metal")]
+    fn assert_tensor_close(a: &Tensor, b: &Tensor, epsilon: f32) -> Result<()> {
+        assert!(a.dtype() == b.dtype());
+        assert_eq!(a.shape(), b.shape());
+        let epsilon = Tensor::full(epsilon, a.shape(), a.device())?.to_dtype(a.dtype())?;
+        let diff = a.broadcast_sub(b)?.abs()?;
+        let result = all(&diff.broadcast_le(&epsilon)?)?;
+        assert!(result);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "metal"))]
     fn assert_tensor_close(a: &Tensor, b: &Tensor, epsilon: f64) -> Result<()> {
         assert!(a.dtype() == b.dtype());
         assert_eq!(a.shape(), b.shape());
@@ -505,6 +551,36 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "metal")]
+    fn cartestian_product(r: Vec<u32>, repeat: usize, dev: &Device) -> Result<Vec<Tensor>> {
+        use itertools::Itertools;
+
+        if repeat <= 1 {
+            return Ok(vec![Tensor::new(r.as_slice(), dev)?]);
+        }
+
+        let mut a: Vec<Vec<u32>> = r
+            .iter()
+            .cartesian_product(r.iter())
+            .map(|(&x, &y)| vec![x, y])
+            .collect();
+        for _ in 2..repeat {
+            a = a
+                .iter()
+                .cartesian_product(r.iter())
+                .map(|(x, &y)| {
+                    let mut z = Vec::from(x.to_owned());
+                    z.push(y);
+                    z
+                })
+                .collect();
+        }
+        Ok(a.iter()
+            .map(|x| Tensor::new(x.as_slice(), dev).unwrap())
+            .collect())
+    }
+
+    #[cfg(not(feature = "metal"))]
     fn cartestian_product(r: Vec<i64>, repeat: usize, dev: &Device) -> Result<Vec<Tensor>> {
         use itertools::Itertools;
 
@@ -622,8 +698,15 @@ mod tests {
         let tag_dim1 = tag.dims1()?;
         assert_eq!(emission_dim1, tag_dim1);
         assert_eq!(emission_dim2, crf.num_tags);
+
+        #[cfg(feature = "metal")]
+        assert_all(tag, 0_u32, crf.num_tags as u32 - 1)?;
+        #[cfg(not(feature = "metal"))]
         assert_all(tag, 0_i64, crf.num_tags as i64 - 1)?;
 
+        #[cfg(feature = "metal")]
+        let tag_vec = tag.to_vec1::<u32>()?;
+        #[cfg(not(feature = "metal"))]
         let tag_vec = tag.to_vec1::<i64>()?;
 
         let mut score = crf
@@ -713,17 +796,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[-0.0687, 0.0698, -0.0447, 0.0421, 0.0782], device)?
+                Tensor::new(&[-0.0687_f32, 0.0698, -0.0447, 0.0421, 0.0782], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0061, -0.0671, -0.0797, 0.0629, -0.0136], device)?
+                Tensor::new(&[0.0061_f32, -0.0671, -0.0797, 0.0629, -0.0136], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [0.0489, -0.0002, 0.0619, 0.0458, 0.0662],
+                        [0.0489_f32, -0.0002, 0.0619, 0.0458, 0.0662],
                         [0.0707, 0.0297, -0.0422, 0.0831, -0.0038],
                         [0.0439, 0.0178, -0.0754, 0.0260, 0.0681],
                         [0.0191, 0.0755, 0.0230, 0.0209, -0.0768],
@@ -739,7 +822,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [1.1699, 1.1900, -0.7254, 0.1490, -1.4910],
+                    [1.1699_f32, 1.1900, -0.7254, 0.1490, -1.4910],
                     [-1.2101, 0.4538, 1.3654, 0.0135, -1.8480],
                 ],
                 [
@@ -755,6 +838,9 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[2_u32, 4], [3, 3], [4, 2]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[2_i64, 4], [3, 3], [4, 2]], device)?;
         let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
         let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::default())?;
@@ -777,7 +863,11 @@ mod tests {
             let tag = tag.i(..seq_len)?;
             let numerator = compute_score(&crf, &emission, &tag)?;
 
+            #[cfg(feature = "metal")]
+            let num_tags = crf.num_tags as u32;
+            #[cfg(not(feature = "metal"))]
             let num_tags = crf.num_tags as i64;
+
             let product = cartestian_product((0..num_tags).collect_vec(), seq_len, device)?;
             let all_scores = product
                 .iter()
@@ -824,14 +914,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0266, -0.0539, 0.0572, -0.0199, -0.0167], device)?
+                Tensor::new(&[0.0266_f32, -0.0539, 0.0572, -0.0199, -0.0167], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(Tensor::new(&[0.0084, 0.0892, 0.0942, -0.0179, 0.0112], device)?.to_dtype(dtype)?),
+            Some(
+                Tensor::new(&[0.0084_f32, 0.0892, 0.0942, -0.0179, 0.0112], device)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
-                        [0.0456, 0.0560, 0.0396, 0.0289, 0.0187],
+                        [0.0456_f32, 0.0560, 0.0396, 0.0289, 0.0187],
                         [-0.0951, -0.0286, 0.0582, 0.0384, 0.0863],
                         [-0.0137, 0.0764, -0.0414, 0.0722, -0.0287],
                         [0.0365, -0.0033, 0.0726, -0.0620, 0.0516],
@@ -847,7 +940,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [0.5463, 2.0856, -0.6247, -1.0225, 0.5277],
+                    [0.5463_f32, 2.0856, -0.6247, -1.0225, 0.5277],
                     [-0.4172, -1.4281, -0.5658, -0.5217, -0.6321],
                 ],
                 [
@@ -863,6 +956,9 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[3_u32, 2], [3, 1], [4, 3]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[3_i64, 2], [3, 1], [4, 3]], device)?;
 
         let llh_no_mask = crf.forward(&emissions, &tags, None, Reduction::default())?;
@@ -913,17 +1009,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[-0.0695, -0.0117, -0.0021, -0.0635, -0.0328], device)?
+                Tensor::new(&[-0.0695_f32, -0.0117, -0.0021, -0.0635, -0.0328], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0524, -0.0827, 0.0868, -0.0140, 0.0131], device)?
+                Tensor::new(&[-0.0524_f32, -0.0827, 0.0868, -0.0140, 0.0131], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [-0.0330, 0.0894, -0.0732, 0.0996, 0.0014],
+                        [-0.0330_f32, 0.0894, -0.0732, 0.0996, 0.0014],
                         [-0.0514, -0.0677, -0.0611, -0.0168, 0.0297],
                         [0.0580, -0.0224, -0.0465, -0.0527, -0.0133],
                         [0.0506, 0.0535, -0.0378, -0.0537, 0.0516],
@@ -940,7 +1036,7 @@ mod tests {
             &[
                 [
                     [
-                        -1.5867e+00,
+                        -1.5867e+00_f32,
                         -4.0363e-01,
                         1.7869e-02,
                         -5.0247e-01,
@@ -1063,6 +1159,16 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(
+            &[
+                [1_u32, 0, 0, 1, 2, 1, 0, 4, 3, 0],
+                [3, 2, 3, 4, 4, 1, 2, 1, 4, 1],
+                [0, 1, 4, 4, 0, 4, 0, 1, 4, 1],
+            ],
+            device,
+        )?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(
             &[
                 [1_i64, 0, 0, 1, 2, 1, 0, 4, 3, 0],
@@ -1126,17 +1232,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0432, 0.0507, -0.0286, 0.0476, -0.0603], device)?
+                Tensor::new(&[0.0432_f32, 0.0507, -0.0286, 0.0476, -0.0603], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0824, 0.0845, -0.0180, -0.0773, 0.0414], device)?
+                Tensor::new(&[0.0824_f32, 0.0845, -0.0180, -0.0773, 0.0414], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [-0.0894, 0.0512, 0.0066, 0.0534, -0.0182],
+                        [-0.0894_f32, 0.0512, 0.0066, 0.0534, -0.0182],
                         [0.0043, 0.0328, -0.0805, -0.0945, 0.0495],
                         [-0.0020, 0.0416, -0.0441, 0.0390, 0.0690],
                         [-0.0260, 0.0720, 0.0017, -0.0552, -0.0470],
@@ -1152,7 +1258,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [-0.2560, 1.2459, -2.0063, -0.5449, 1.0978],
+                    [-0.2560_f32, 1.2459, -2.0063, -0.5449, 1.0978],
                     [0.7233, -0.6967, 0.3394, 0.7784, -3.0362],
                 ],
                 [
@@ -1168,7 +1274,11 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[1_u32, 3], [1, 3], [1, 2]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[1_i64, 3], [1, 3], [1, 2]], device)?;
+
         let llh = crf.forward(&emissions, &tags, None, Reduction::None)?;
         println!("llh: {:?}", llh);
         let (seq_length, batch_size) = tags.dims2()?;
@@ -1185,6 +1295,9 @@ mod tests {
 
             let numerator = compute_score(&crf, &emission, &tag)?;
 
+            #[cfg(feature = "metal")]
+            let num_tags = crf.num_tags as u32;
+            #[cfg(not(feature = "metal"))]
             let num_tags = crf.num_tags as i64;
             let product = cartestian_product((0..num_tags).collect_vec(), seq_length, device)?;
 
@@ -1231,17 +1344,23 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0606, -0.0597, 0.0217, -0.0760, 0.0096], device)?
+                Tensor::new(&[0.0606_f32, -0.0597, 0.0217, -0.0760, 0.0096], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0791, -0.0159, 0.0525, 0.0451, -0.0373], device)?
+                Tensor::new(&[-0.0791_f32, -0.0159, 0.0525, 0.0451, -0.0373], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [5.0599e-02, -1.4571e-02, 2.2383e-02, 3.3254e-02, 2.5206e-03],
+                        [
+                            5.0599e-02_f32,
+                            -1.4571e-02,
+                            2.2383e-02,
+                            3.3254e-02,
+                            2.5206e-03,
+                        ],
                         [6.6520e-02, 7.3251e-02, 1.0225e-02, -9.4751e-02, -3.4146e-02],
                         [
                             -6.7073e-02,
@@ -1269,7 +1388,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [0.0535, 0.6821, -0.2587, 1.2250, 0.5327],
+                    [0.0535_f32, 0.6821, -0.2587, 1.2250, 0.5327],
                     [-2.5028, 0.5942, -0.2508, 0.0597, 1.3800],
                 ],
                 [
@@ -1285,7 +1404,11 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[3_u32, 0], [0, 3], [2, 4]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[3_i64, 0], [0, 3], [2, 4]], device)?;
+
         let llh = crf.forward(&emissions, &tags, None, Reduction::Mean)?;
         println!("llh: {:?}", llh);
 
@@ -1302,6 +1425,9 @@ mod tests {
 
             let numerator = compute_score(&crf, &emission, &tag)?;
 
+            #[cfg(feature = "metal")]
+            let num_tags = crf.num_tags as u32;
+            #[cfg(not(feature = "metal"))]
             let num_tags = crf.num_tags as i64;
 
             let product =
@@ -1322,7 +1448,13 @@ mod tests {
             manual_llh = (manual_llh + (numerator - denominator)?)?;
         }
 
-        manual_llh = (&manual_llh
+        #[cfg(feature = "metal")]
+        let manual_llh = (&manual_llh
+            / Tensor::full(batch_size as f32, manual_llh.shape(), manual_llh.device())?
+                .to_dtype(manual_llh.dtype())?)?;
+
+        #[cfg(not(feature = "metal"))]
+        let manual_llh = (&manual_llh
             / Tensor::full(batch_size as f64, manual_llh.shape(), manual_llh.device())?
                 .to_dtype(manual_llh.dtype())?)?;
 
@@ -1354,10 +1486,19 @@ mod tests {
         let crf = make_crf(
             5,
             false,
-            Some(Tensor::new(&[0.0687, 0.0533, 0.0204, 0.0250, -0.0785], device)?.to_dtype(dtype)?),
+            Some(
+                Tensor::new(&[0.0687_f32, 0.0533, 0.0204, 0.0250, -0.0785], device)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
-                    &[4.8827e-02, -9.9134e-05, 9.3184e-02, -7.6271e-02, 3.6482e-02],
+                    &[
+                        4.8827e-02_f32,
+                        -9.9134e-05,
+                        9.3184e-02,
+                        -7.6271e-02,
+                        3.6482e-02,
+                    ],
                     device,
                 )?
                 .to_dtype(dtype)?,
@@ -1365,7 +1506,7 @@ mod tests {
             Some(
                 Tensor::new(
                     &[
-                        [0.0173, -0.0058, -0.0699, -0.0374, 0.0797],
+                        [0.0173_f32, -0.0058, -0.0699, -0.0374, 0.0797],
                         [-0.0405, 0.0141, -0.0002, 0.0790, 0.0205],
                         [-0.0473, 0.0554, -0.0036, 0.0878, 0.0210],
                         [0.0761, -0.0406, -0.0905, 0.0590, -0.0030],
@@ -1381,7 +1522,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [0.0110, -0.8502, 0.9678, -0.3219, -0.6029],
+                    [0.0110_f32, -0.8502, 0.9678, -0.3219, -0.6029],
                     [1.0804, -1.2822, 1.4129, 0.9475, -2.6282],
                 ],
                 [
@@ -1397,7 +1538,11 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[2_u32, 2], [0, 4], [3, 3]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[2_i64, 2], [0, 4], [3, 3]], device)?;
+
         let mask = Tensor::new(&[[1_u8, 1, 1], [1, 1, 0]], device)?.transpose(0, 1)?;
         let llh = crf.forward(&emissions, &tags, Some(&mask), Reduction::TokenMean)?;
         println!("llh: {:?}", llh);
@@ -1419,7 +1564,11 @@ mod tests {
             let tag = tag.i(..seq_len)?;
             let numerator = compute_score(&crf, &emission, &tag)?;
 
+            #[cfg(feature = "metal")]
+            let num_tags = crf.num_tags as u32;
+            #[cfg(not(feature = "metal"))]
             let num_tags = crf.num_tags as i64;
+
             let product = cartestian_product((0..num_tags).collect_vec(), seq_len, device)?;
 
             let all_scores = product
@@ -1437,6 +1586,11 @@ mod tests {
             total_tokens += seq_len;
         }
 
+        #[cfg(feature = "metal")]
+        let total_tokens =
+            Tensor::full(total_tokens as f32, manual_llh.shape(), manual_llh.device())?
+                .to_dtype(manual_llh.dtype())?;
+        #[cfg(not(feature = "metal"))]
         let total_tokens =
             Tensor::full(total_tokens as f64, manual_llh.shape(), manual_llh.device())?
                 .to_dtype(manual_llh.dtype())?;
@@ -1473,14 +1627,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0384, -0.0811, -0.0291, 0.0444, 0.0943], device)?
+                Tensor::new(&[0.0384_f32, -0.0811, -0.0291, 0.0444, 0.0943], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(Tensor::new(&[0.0146, 0.0455, 0.0991, 0.0640, -0.0298], device)?.to_dtype(dtype)?),
+            Some(
+                Tensor::new(&[0.0146_f32, 0.0455, 0.0991, 0.0640, -0.0298], device)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
-                        [0.0063, 0.0014, 0.0804, -0.0385, -0.0485],
+                        [0.0063_f32, 0.0014, 0.0804, -0.0385, -0.0485],
                         [0.0485, -0.0963, 0.0799, 0.0198, -0.0549],
                         [0.0016, 0.0012, -0.0411, 0.0540, -0.0823],
                         [0.0111, 0.0320, 0.0769, 0.0292, -0.0707],
@@ -1496,7 +1653,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [-1.1338, -0.9228, 0.3260, 0.0327, -1.0345],
+                    [-1.1338_f32, -0.9228, 0.3260, 0.0327, -1.0345],
                     [0.1106, 0.8005, 0.3860, -0.1214, -1.8224],
                 ],
                 [
@@ -1512,7 +1669,11 @@ mod tests {
         )?
         .to_dtype(dtype)?;
 
+        #[cfg(feature = "metal")]
+        let tags = Tensor::new(&[[1_u32, 4], [1, 4], [1, 4]], device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::new(&[[1_i64, 4], [1, 4], [1, 4]], device)?;
+
         let llh = crf.forward(&emissions, &tags, None, Reduction::default())?;
         println!("llh: {:?}", llh);
 
@@ -1561,6 +1722,10 @@ mod tests {
         let device = use_gpu(false)?;
 
         let emissions = Tensor::randn(0.0_f32, 1., (1, 2), &device)?;
+
+        #[cfg(feature = "metal")]
+        let tags = Tensor::zeros((2, 2), DType::U32, &device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::zeros((2, 2), DType::I64, &device)?;
 
         let crf = make_crf(5, false, None, None, None, &device)?;
@@ -1583,7 +1748,11 @@ mod tests {
         let device = use_gpu(false)?;
 
         let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        #[cfg(feature = "metal")]
+        let tags = Tensor::zeros((2, 2), DType::U32, &device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::zeros((2, 2), DType::I64, &device)?;
+
         let crf = make_crf(3, false, None, None, None, &device)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
@@ -1604,7 +1773,11 @@ mod tests {
         let device = use_gpu(false)?;
 
         let emissions = Tensor::randn(0.0_f32, 1., (1, 2, 3), &device)?;
+        #[cfg(feature = "metal")]
+        let tags = Tensor::zeros((1, 2), DType::U32, &device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::zeros((1, 2), DType::I64, &device)?;
+
         let crf = make_crf(10, false, None, None, None, &device)?;
         let result = crf.forward(&emissions, &tags, None, Reduction::default());
         println!("{:?}", result);
@@ -1625,7 +1798,11 @@ mod tests {
         let device = use_gpu(false)?;
 
         let emissions = Tensor::randn(0.0_f32, 1., (3, 2, 4), &device)?;
+        #[cfg(feature = "metal")]
+        let tags = Tensor::zeros((3, 2), DType::U32, &device)?;
+        #[cfg(not(feature = "metal"))]
         let tags = Tensor::zeros((3, 2), DType::I64, &device)?;
+
         let mask = Tensor::new(&[[1_u8, 1, 1], [0, 0, 0]], &device)
             .unwrap()
             .transpose(0, 1)?;
@@ -1660,17 +1837,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0548, -0.0239, -0.0291, -0.0208, 0.0665], device)?
+                Tensor::new(&[0.0548_f32, -0.0239, -0.0291, -0.0208, 0.0665], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0612, -0.0615, -0.0557, 0.0672, 0.0470], device)?
+                Tensor::new(&[-0.0612_f32, -0.0615, -0.0557, 0.0672, 0.0470], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [-0.0751, -0.0941, 0.0248, 0.0900, -0.0776],
+                        [-0.0751_f32, -0.0941, 0.0248, 0.0900, -0.0776],
                         [0.0381, -0.0550, -0.0333, -0.0124, -0.0356],
                         [-0.0383, -0.0910, 0.0914, -0.0330, -0.0119],
                         [0.0358, 0.0513, 0.0013, -0.0380, 0.0626],
@@ -1686,7 +1863,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [1.8238, 1.3041, -0.0845, 1.3981, 0.1027],
+                    [1.8238_f32, 1.3041, -0.0845, 1.3981, 0.1027],
                     [1.1092, -0.1616, 1.9770, -1.6850, -1.4289],
                 ],
                 [
@@ -1728,17 +1905,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[0.0762, 0.0743, 0.0234, -0.0387, -0.0269], device)?
+                Tensor::new(&[0.0762_f32, 0.0743, 0.0234, -0.0387, -0.0269], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[0.0102, -0.0137, -0.0149, 0.0700, -0.0701], device)?
+                Tensor::new(&[0.0102_f32, -0.0137, -0.0149, 0.0700, -0.0701], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [-0.0620, -0.0527, 0.0034, 0.0694, -0.0853],
+                        [-0.0620_f32, -0.0527, 0.0034, 0.0694, -0.0853],
                         [0.0922, -0.0613, -0.0592, 0.0482, 0.0632],
                         [-0.0433, 0.0069, -0.0161, -0.0330, -0.0602],
                         [-0.0649, 0.0047, 0.0593, 0.0733, 0.0203],
@@ -1754,7 +1931,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [0.8913, -0.0355, -1.4378, 0.8390, -0.7296],
+                    [0.8913_f32, -0.0355, -1.4378, 0.8390, -0.7296],
                     [1.5530, -1.3165, -0.5769, -0.8085, -0.2610],
                 ],
                 [
@@ -1783,7 +1960,7 @@ mod tests {
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let device = use_gpu(false)?;
 
-        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+        for dtype in OK_TYPES {
             decode_works_without_mask(dtype, &device)?;
         }
         Ok(())
@@ -1795,14 +1972,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[-0.0489, 0.0460, -0.0924, -0.0722, 0.0736], device)?
+                Tensor::new(&[-0.0489_f32, 0.0460, -0.0924, -0.0722, 0.0736], device)?
                     .to_dtype(dtype)?,
             ),
-            Some(Tensor::new(&[0.0843, 0.0344, -0.0996, 0.0944, 0.0622], device)?.to_dtype(dtype)?),
+            Some(
+                Tensor::new(&[0.0843_f32, 0.0344, -0.0996, 0.0944, 0.0622], device)?
+                    .to_dtype(dtype)?,
+            ),
             Some(
                 Tensor::new(
                     &[
-                        [0.0780, -0.0794, 0.0208, 0.0039, 0.0080],
+                        [0.0780_f32, -0.0794, 0.0208, 0.0039, 0.0080],
                         [-0.0923, -0.0359, 0.0103, 0.0550, -0.0029],
                         [0.0628, -0.0787, -0.0256, 0.0554, -0.0969],
                         [0.0655, -0.0055, 0.0718, -0.0275, -0.0994],
@@ -1818,7 +1998,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [0.7720, 0.9488, 0.6672, 1.8839, -0.6844],
+                    [0.7720_f32, 0.9488, 0.6672, 1.8839, -0.6844],
                     [1.6192, 0.2733, 0.8063, -0.0377, -2.3208],
                 ],
                 [
@@ -1874,17 +2054,17 @@ mod tests {
             5,
             false,
             Some(
-                Tensor::new(&[-0.0464, 0.0818, 0.0829, -0.0121, -0.0788], device)?
+                Tensor::new(&[-0.0464_f32, 0.0818, 0.0829, -0.0121, -0.0788], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
-                Tensor::new(&[-0.0088, 0.0586, 0.0057, 0.0316, -0.0388], device)?
+                Tensor::new(&[-0.0088_f32, 0.0586, 0.0057, 0.0316, -0.0388], device)?
                     .to_dtype(dtype)?,
             ),
             Some(
                 Tensor::new(
                     &[
-                        [-0.0536, -0.0093, 0.0276, 0.0351, 0.0604],
+                        [-0.0536_f32, -0.0093, 0.0276, 0.0351, 0.0604],
                         [0.0734, 0.0764, -0.0773, 0.0821, 0.0294],
                         [-0.0540, -0.0158, 0.0437, 0.0992, 0.0473],
                         [0.0875, 0.0324, -0.0941, 0.0585, 0.0761],
@@ -1900,7 +2080,7 @@ mod tests {
         let emissions = Tensor::new(
             &[
                 [
-                    [-0.6633, 1.4045, -1.3710, 1.5054, 0.8431],
+                    [-0.6633_f32, 1.4045, -1.3710, 1.5054, 0.8431],
                     [-0.1157, -0.0201, -0.2685, -0.6683, 0.0213],
                 ],
                 [
