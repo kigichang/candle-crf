@@ -1,6 +1,6 @@
 [package]
 name = "candle-crf"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 description = "porting pytorch-crf to candle"
 readme = "README.md"
@@ -9,13 +9,13 @@ license-file = "LICENSE"
 keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
-candle-core = "0.6.0"
-candle-nn = "0.6.0"
+candle-core = "0.7.2"
+candle-nn = "0.7.2"
 
 [dev-dependencies]
 itertools = "0.13.0"
 tuple-conv = "1.0.1"
-anyhow = "1.0.88"
+anyhow = "1.0.89"
 
 [features]
 default = []

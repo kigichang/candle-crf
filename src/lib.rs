@@ -17,7 +17,42 @@ impl Default for Reduction {
     }
 }
 
-// -----------------------------------------------------------------------------
+pub fn crf(num_tags: usize, batch_first: bool, vb: VarBuilder) -> Result<CRF> {
+    let start_transitions = vb.get_with_hints(
+        num_tags,
+        "start_transitions",
+        Init::Uniform {
+            lo: -0.1_f64,
+            up: 1.0_f64,
+        },
+    )?;
+
+    let end_transitions = vb.get_with_hints(
+        num_tags,
+        "end_transitions",
+        Init::Uniform {
+            lo: -0.1_f64,
+            up: 1.0_f64,
+        },
+    )?;
+
+    let transitions = vb.get_with_hints(
+        (num_tags, num_tags),
+        "transitions",
+        Init::Uniform {
+            lo: -0.1_f64,
+            up: 1.0_f64,
+        },
+    )?;
+
+    Ok(CRF {
+        num_tags,
+        batch_first,
+        start_transitions,
+        end_transitions,
+        transitions,
+    })
+}
 
 /// CRF
 /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L9
@@ -30,9 +65,9 @@ pub struct CRF {
     pub(crate) transitions: Tensor,
 }
 
-/// CRF
-/// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L60
 impl Display for CRF {
+    /// Display
+    /// https://github.com/kmkurn/pytorch-crf/blob/623e3402d00a2728e99d6e8486010d67c754267b/torchcrf/__init__.py#L60
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -72,10 +107,10 @@ impl CRF {
             return Err(Error::Msg("num_tags must be greater than 0".to_string()));
         }
 
-        let start_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
-        let end_transitions = Tensor::zeros(num_tags, dtype, &device)?.rand_like(-0.1, 1.0)?;
+        let start_transitions = Tensor::rand(-0.1_f32, 1.0, num_tags, device)?.to_dtype(dtype)?;
+        let end_transitions = Tensor::rand(-0.1_f32, 1.0, num_tags, device)?.to_dtype(dtype)?;
         let transitions =
-            Tensor::zeros((num_tags, num_tags), dtype, &device)?.rand_like(-0.1, 1.0)?;
+            Tensor::rand(-0.1_f32, 1.0, (num_tags, num_tags), device)?.to_dtype(dtype)?;
 
         Ok(Self {
             num_tags,
@@ -87,40 +122,7 @@ impl CRF {
     }
 
     pub fn load(num_tags: usize, batch_first: bool, vb: VarBuilder) -> Result<Self> {
-        let start_transitions = vb.get_with_hints(
-            num_tags,
-            "start_transitions",
-            Init::Uniform {
-                lo: -0.1_f64,
-                up: 1.0_f64,
-            },
-        )?;
-
-        let end_transitions = vb.get_with_hints(
-            num_tags,
-            "end_transitions",
-            Init::Uniform {
-                lo: -0.1_f64,
-                up: 1.0_f64,
-            },
-        )?;
-
-        let transitions = vb.get_with_hints(
-            (num_tags, num_tags),
-            "transitions",
-            Init::Uniform {
-                lo: -0.1_f64,
-                up: 1.0_f64,
-            },
-        )?;
-
-        Ok(Self {
-            num_tags,
-            batch_first,
-            start_transitions,
-            end_transitions,
-            transitions,
-        })
+        crf(num_tags, batch_first, vb)
     }
 
     /// validate
