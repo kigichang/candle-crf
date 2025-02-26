@@ -9,13 +9,13 @@ license-file = "LICENSE"
 keywords = ["candle", "crf", "pytorch"]
 
 [dependencies]
-candle-core = "0.8.0"
-candle-nn = "0.8.0"
+candle-core = "0.8.3"
+candle-nn = "0.8.3"
 
 [dev-dependencies]
-itertools = "0.13.0"
+itertools = "0.14.0"
 tuple-conv = "1.0.1"
-anyhow = "1.0.93"
+anyhow = "1.0.96"
 
 [features]
 default = []
