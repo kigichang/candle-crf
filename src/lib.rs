@@ -435,11 +435,7 @@ impl CRF {
 
 pub(crate) fn all(x: &Tensor) -> Result<bool> {
     let zero = x.zeros_like()?;
-    Ok(x.broadcast_ne(&zero)?
-        .flatten_all()?
-        .min(0)?
-        .to_scalar::<u8>()?
-        != 0)
+    Ok(x.broadcast_ne(&zero)?.min_all()?.to_scalar::<u8>()? != 0)
 }
 
 // -----------------------------------------------------------------------------
